@@ -22,8 +22,11 @@ const DEFAULT_ALIAS = process.env.DEFAULT_ALIAS ?? 'live';
 const ROLLBACK_ROLE_ARN = process.env.ROLLBACK_ROLE_ARN;
 // e.g. arn:aws:lambda:eu-central-1:123456789012:function:
 const FUNCTION_ARN_PREFIX = process.env.FUNCTION_ARN_PREFIX;
-// Only functions listed here are plugged into automatic rollback.
-const ENABLED_FUNCTIONS = new Set(config.enabledFunctions ?? []);
+// Functions registered for automatic rollback, and the alarms allowed to trigger each one.
+// Deregister a function by removing it or setting "enabled": false.
+const REGISTERED = new Map((config.functions ?? [])
+  .filter((fn) => fn.enabled !== false)
+  .map((fn) => [fn.name, new Set(fn.alarms ?? [])]));
 // Automatic rollbacks in a row before giving up; the count resets on the next deploy.
 const MAX_CONSECUTIVE_ROLLBACKS = config.maxConsecutiveRollbacks ?? 2;
 // Time the alarm gets to evaluate a version after a rollback, before another one may happen.
@@ -35,7 +38,7 @@ const ROLLBACK_MARKER = /^(auto|manual)-rollback(?: #(\d+))? from v\d+ at (\S+)$
 
 export const handler = async (event) => {
   if (event.type === 'scheduled-check') {
-    return checkAlarms(event.alarmNames ?? []);
+    return checkAlarms([...REGISTERED.values()].flatMap((alarms) => [...alarms]));
   }
 
   const results = [];
@@ -46,7 +49,7 @@ export const handler = async (event) => {
   return results;
 };
 
-// Scheduled re-check: treat every listed alarm still in ALARM as if it had just fired.
+// Scheduled re-check: treat every registered alarm still in ALARM as if it had just fired.
 async function checkAlarms(alarmNames) {
   if (alarmNames.length === 0) return [];
   const { MetricAlarms = [] } = await cloudwatch.send(new DescribeAlarmsCommand({ AlarmNames: alarmNames }));
@@ -78,9 +81,9 @@ async function handleAlarm(alarm) {
   }
   const { functionName, aliasName } = target;
 
-  const lambda = await preHook(functionName);
+  const { lambda, reason } = await preHook(functionName, alarm.AlarmName);
   if (!lambda) {
-    return skip(`${functionName} is not enabled for rollback (see config.json)`);
+    return skip(reason);
   }
 
   const alias = await lambda.send(new GetAliasCommand({ FunctionName: functionName, Name: aliasName }));
@@ -154,13 +157,20 @@ async function restoreLatest(lambda, functionName, version) {
   return updated.CodeSha256;
 }
 
-// Runs before any rollback: checks the function is enabled in config.json and, if so,
-// returns a Lambda client whose credentials can touch only that one function.
+// Runs before any rollback: checks the function is registered in config.json and the alarm
+// is one of its registered alarms. If so, returns a Lambda client whose credentials can touch
+// only that one function; otherwise returns the reason to skip.
 // This function's own role has no Lambda permissions; it can only assume the rollback role,
 // and the session policy narrows that role down to the target function.
-async function preHook(functionName) {
-  if (!ENABLED_FUNCTIONS.has(functionName)) return undefined;
-  console.log(`Pre-hook: ${functionName} found in config.json, rollback enabled`);
+async function preHook(functionName, alarmName) {
+  const alarms = REGISTERED.get(functionName);
+  if (!alarms) {
+    return { reason: `${functionName} is not registered for rollback (see config.json)` };
+  }
+  if (!alarms.has(alarmName)) {
+    return { reason: `alarm '${alarmName}' is not registered for ${functionName} (see config.json)` };
+  }
+  console.log(`Pre-hook: ${functionName} found in config.json with alarm '${alarmName}', rollback enabled`);
 
   const functionArn = `${FUNCTION_ARN_PREFIX}${functionName}`;
   const { Credentials } = await sts.send(new AssumeRoleCommand({
@@ -184,7 +194,7 @@ async function preHook(functionName) {
   }));
   console.log(`Pre-hook: using credentials scoped to ${functionArn}`);
 
-  return new LambdaClient({
+  const lambda = new LambdaClient({
     credentials: {
       accessKeyId: Credentials.AccessKeyId,
       secretAccessKey: Credentials.SecretAccessKey,
@@ -192,6 +202,7 @@ async function preHook(functionName) {
       expiration: Credentials.Expiration,
     },
   });
+  return { lambda };
 }
 
 // Single-metric alarms carry Trigger.Dimensions; metric-math alarms carry one

@@ -1,6 +1,12 @@
 {
-  "enabledFunctions": [
-    "service-lambda"
-  ],
-  "maxConsecutiveRollbacks": 2
+  "maxConsecutiveRollbacks": 2,
+  "functions": [
+    {
+      "name": "service-lambda",
+      "enabled": true,
+      "alarms": [
+        "service-lambda-errors"
+      ]
+    }
+  ]
 }

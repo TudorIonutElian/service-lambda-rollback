@@ -32,6 +32,9 @@ function versionDescription(): string {
   }
 }
 
+// Functions registered in lambda-rollback/config.json; disabled entries get no permissions.
+const registeredFunctions = rollbackConfig.functions.filter((f) => f.enabled !== false);
+
 export class ServiceStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
@@ -80,24 +83,26 @@ export class ServiceStack extends cdk.Stack {
 
     // The rollback function's own role has no Lambda permissions. Its pre-hook checks
     // lambda-rollback/config.json, then assumes this role with a session policy scoped
-    // to the single erroring function. This role is the upper bound: enabled functions only.
+    // to the single erroring function. This role is the upper bound: registered functions only.
     const rollbackRole = new iam.Role(this, 'RollbackExecutionRole', {
       assumedBy: rollbackFn.role!,
       maxSessionDuration: cdk.Duration.hours(1),
     });
-    const enabledArns = rollbackConfig.enabledFunctions.map((name) =>
+    const enabledArns = registeredFunctions.map(({ name }) =>
       this.formatArn({ service: 'lambda', resource: 'function', resourceName: name, arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME }));
-    rollbackRole.addToPolicy(new iam.PolicyStatement({
-      actions: [
-        'lambda:GetAlias',
-        'lambda:ListVersionsByFunction',
-        'lambda:UpdateAlias',
-        // Restoring $LATEST: read the target version's package, upload it as $LATEST.
-        'lambda:GetFunction',
-        'lambda:UpdateFunctionCode',
-      ],
-      resources: enabledArns.flatMap((arn) => [arn, `${arn}:*`]),
-    }));
+    if (enabledArns.length > 0) {
+      rollbackRole.addToPolicy(new iam.PolicyStatement({
+        actions: [
+          'lambda:GetAlias',
+          'lambda:ListVersionsByFunction',
+          'lambda:UpdateAlias',
+          // Restoring $LATEST: read the target version's package, upload it as $LATEST.
+          'lambda:GetFunction',
+          'lambda:UpdateFunctionCode',
+        ],
+        resources: enabledArns.flatMap((arn) => [arn, `${arn}:*`]),
+      }));
+    }
     rollbackRole.grantAssumeRole(rollbackFn.role!);
     rollbackFn.addEnvironment('ROLLBACK_ROLE_ARN', rollbackRole.roleArn);
 
@@ -137,21 +142,23 @@ export class ServiceStack extends cdk.Stack {
     // CloudWatch only notifies when the alarm changes state. If the version we rolled back to
     // also fails, the alarm just stays in ALARM; this schedule catches that and rolls back again
     // (subject to the cooldown and maxConsecutiveRollbacks in lambda-rollback/config.json).
+    // Which alarms are checked comes from the registered functions in config.json.
     new events.Rule(this, 'RollbackCheckSchedule', {
       ruleName: `${ROLLBACK_FUNCTION_NAME}-check`,
-      description: `Every ${ROLLBACK_CHECK_INTERVAL_MINUTES} min, roll back again if ${errorsAlarm.alarmName} is still in ALARM`,
+      description: `Every ${ROLLBACK_CHECK_INTERVAL_MINUTES} min, roll back again if a registered alarm is still in ALARM`,
       schedule: events.Schedule.rate(cdk.Duration.minutes(ROLLBACK_CHECK_INTERVAL_MINUTES)),
       targets: [new targets.LambdaFunction(rollbackFn, {
-        event: events.RuleTargetInput.fromObject({
-          type: 'scheduled-check',
-          alarmNames: [errorsAlarm.alarmName],
-        }),
+        event: events.RuleTargetInput.fromObject({ type: 'scheduled-check' }),
       })],
     });
-    rollbackFn.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['cloudwatch:DescribeAlarms'],
-      resources: [errorsAlarm.alarmArn],
-    }));
+    const registeredAlarmArns = registeredFunctions.flatMap(({ alarms }) => alarms.map((name) =>
+      this.formatArn({ service: 'cloudwatch', resource: 'alarm', resourceName: name, arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME })));
+    if (registeredAlarmArns.length > 0) {
+      rollbackFn.addToRolePolicy(new iam.PolicyStatement({
+        actions: ['cloudwatch:DescribeAlarms'],
+        resources: registeredAlarmArns,
+      }));
+    }
 
     new cdk.CfnOutput(this, 'FunctionName', { value: fn.functionName });
     new cdk.CfnOutput(this, 'AliasArn', { value: alias.functionArn });
