@@ -90,10 +90,22 @@ Edit `lambda-rollback/config.json` and deploy:
 {
   "maxConsecutiveRollbacks": 2,
   "functions": [
-    { "name": "service-lambda", "enabled": true, "alias": "live", "alarms": ["service-lambda-errors"] }
+    { "name": "service-lambda", "enabled": true, "alias": "live", "alarms": ["service-lambda-errors"] },
+    { "name": "other-lambda", "alarms": ["other-lambda-errors"], "maxConsecutiveRollbacks": 3 }
   ]
 }
 ```
+
+| Field | Where | Default | Meaning |
+|---|---|---|---|
+| `maxConsecutiveRollbacks` | top level | `2` | Automatic rollbacks in a row before giving up, for functions that don't set their own |
+| `name` | function | required | Lambda function name |
+| `alarms` | function | `[]` | Alarms allowed to trigger this function's rollback |
+| `alias` | function | `live` | Alias to roll back |
+| `enabled` | function | `true` | `false` deregisters the function without removing the entry |
+| `maxConsecutiveRollbacks` | function | top-level value | This function's own limit; `0` turns off automatic rollback but keeps the archive and manual rollback |
+
+The count resets on the next deploy.
 
 - **Register:** add an entry with the function name, its alias (default `live`) and the alarms
   allowed to trigger its rollback.

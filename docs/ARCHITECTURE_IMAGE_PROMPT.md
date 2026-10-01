@@ -58,7 +58,7 @@ GROUP B — "Detection":
 GROUP C — "Rollback":
   - A Lambda icon labelled "service-lambda-rollback".
   - Attached to it, a small document icon labelled "config.json — registered functions, alias,
-    alarms, enabled flag, maxConsecutiveRollbacks".
+    alarms, enabled flag, maxConsecutiveRollbacks (per function or general)".
   - Directly below the rollback Lambda, a small numbered checklist box labelled "Pre-hook":
       "1. Function registered & enabled in config.json?"
       "2. Alarm registered for that function?"
@@ -170,7 +170,7 @@ What actually exists in this repository, to check the generated image against.
 | DynamoDB table | `service-lambda-rollback-versions` (PK `functionName`, SK `sk`: `VERSION#…` / `CURRENT`) | `lib/service-stack.ts` |
 | S3 bucket | `service-lambda-rollback-artifacts-<account>-<region>`, keys `<fn>/<fn>-<version>.zip` | `lib/service-stack.ts` |
 | Lambda function | `service-lambda-rollback` (sync/archive, alarm handling, rollback) | `lambda-rollback/index.mjs` |
-| Config | registered functions, alias, alarms, `enabled`, `maxConsecutiveRollbacks` | `lambda-rollback/config.json` |
+| Config | registered functions, alias, alarms, `enabled`, `maxConsecutiveRollbacks` (per function, falling back to the general value) | `lambda-rollback/config.json` |
 | IAM role | `RollbackExecutionRole` (Lambda, S3 and DynamoDB permissions for registered functions only) | `lib/service-stack.ts` |
 | STS | `AssumeRole` with a session policy scoped to one function, its S3 folder and its DynamoDB items | `lambda-rollback/index.mjs` |
 

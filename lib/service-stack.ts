@@ -182,7 +182,7 @@ export class ServiceStack extends cdk.Stack {
     // Every run first syncs version metadata and packages of registered functions (DynamoDB + S3).
     // Then, since CloudWatch only notifies when the alarm changes state, it re-checks registered
     // alarms: if the version we rolled back to also fails, the alarm just stays in ALARM; this
-    // catches that and rolls back again (subject to the cooldown and maxConsecutiveRollbacks).
+    // catches that and rolls back again (subject to the cooldown and each function's maxConsecutiveRollbacks).
     // Which alarms are checked comes from the registered functions in config.json.
     new events.Rule(this, 'RollbackCheckSchedule', {
       ruleName: `${ROLLBACK_FUNCTION_NAME}-check`,
