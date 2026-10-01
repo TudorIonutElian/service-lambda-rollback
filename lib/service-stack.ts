@@ -7,6 +7,7 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as subscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
 import { Construct } from 'constructs';
+import rollbackConfig from '../lambda-rollback/config.json';
 
 export const FUNCTION_NAME = 'service-lambda';
 export const ALIAS_NAME = 'live';
@@ -44,14 +45,27 @@ export class ServiceStack extends cdk.Stack {
       handler: 'index.handler',
       code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda-rollback')),
       timeout: cdk.Duration.seconds(30),
-      environment: { DEFAULT_ALIAS: ALIAS_NAME },
+      environment: {
+        DEFAULT_ALIAS: ALIAS_NAME,
+        FUNCTION_ARN_PREFIX: `arn:${cdk.Aws.PARTITION}:lambda:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:function:`,
+      },
     });
 
-    // Only allowed to move aliases of the service function.
-    rollbackFn.addToRolePolicy(new iam.PolicyStatement({
+    // The rollback function's own role has no Lambda permissions. Its pre-hook checks
+    // lambda-rollback/config.json, then assumes this role with a session policy scoped
+    // to the single erroring function. This role is the upper bound: enabled functions only.
+    const rollbackRole = new iam.Role(this, 'RollbackExecutionRole', {
+      assumedBy: rollbackFn.role!,
+      maxSessionDuration: cdk.Duration.hours(1),
+    });
+    const enabledArns = rollbackConfig.enabledFunctions.map((name) =>
+      this.formatArn({ service: 'lambda', resource: 'function', resourceName: name, arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME }));
+    rollbackRole.addToPolicy(new iam.PolicyStatement({
       actions: ['lambda:GetAlias', 'lambda:ListVersionsByFunction', 'lambda:UpdateAlias'],
-      resources: [fn.functionArn, `${fn.functionArn}:*`],
+      resources: enabledArns.flatMap((arn) => [arn, `${arn}:*`]),
     }));
+    rollbackRole.grantAssumeRole(rollbackFn.role!);
+    rollbackFn.addEnvironment('ROLLBACK_ROLE_ARN', rollbackRole.roleArn);
 
     rollbackTopic.addSubscription(new subscriptions.LambdaSubscription(rollbackFn));
 
