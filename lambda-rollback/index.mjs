@@ -1,8 +1,14 @@
-// Invoked by SNS when a CloudWatch alarm goes into ALARM, and every few minutes by an
-// EventBridge schedule that re-checks alarms still in ALARM (CloudWatch only notifies on
-// state changes, so a rolled-back version that also fails would otherwise never trigger).
-// Moves the alias back to the previous published version and puts that version's
-// package back into $LATEST. No build: the package is the one Lambda already stores.
+// Rollback system for registered Lambda functions (see config.json).
+//
+// Invoked by:
+//   - SNS, when a registered CloudWatch alarm goes into ALARM;
+//   - EventBridge every few minutes ({ type: 'scheduled-check' }): syncs metadata and re-checks
+//     alarms still in ALARM (CloudWatch only notifies on state changes);
+//   - the deploy workflows after `cdk deploy` ({ type: 'sync' }).
+//
+// Sync keeps a DynamoDB record of every published version and copies each version's package to S3
+// as <fn>/<fn>-<version>.zip. A rollback moves the alias to the previous archived version and
+// restores $LATEST from that zip. Nothing is rebuilt.
 import {
   LambdaClient,
   GetAliasCommand,
@@ -14,6 +20,15 @@ import {
 } from '@aws-sdk/client-lambda';
 import { STSClient, AssumeRoleCommand } from '@aws-sdk/client-sts';
 import { CloudWatchClient, DescribeAlarmsCommand } from '@aws-sdk/client-cloudwatch';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import {
+  DynamoDBClient,
+  GetItemCommand,
+  PutItemCommand,
+  UpdateItemCommand,
+  QueryCommand,
+  paginateQuery,
+} from '@aws-sdk/client-dynamodb';
 import config from './config.json' with { type: 'json' };
 
 const sts = new STSClient({});
@@ -22,23 +37,31 @@ const DEFAULT_ALIAS = process.env.DEFAULT_ALIAS ?? 'live';
 const ROLLBACK_ROLE_ARN = process.env.ROLLBACK_ROLE_ARN;
 // e.g. arn:aws:lambda:eu-central-1:123456789012:function:
 const FUNCTION_ARN_PREFIX = process.env.FUNCTION_ARN_PREFIX;
-// Functions registered for automatic rollback, and the alarms allowed to trigger each one.
+const TABLE_NAME = process.env.TABLE_NAME;
+const TABLE_ARN = process.env.TABLE_ARN;
+const BUCKET_NAME = process.env.BUCKET_NAME;
+
+// Functions registered for automatic rollback, their alias, and the alarms allowed to trigger them.
 // Deregister a function by removing it or setting "enabled": false.
 const REGISTERED = new Map((config.functions ?? [])
   .filter((fn) => fn.enabled !== false)
-  .map((fn) => [fn.name, new Set(fn.alarms ?? [])]));
+  .map((fn) => [fn.name, { alias: fn.alias ?? DEFAULT_ALIAS, alarms: new Set(fn.alarms ?? []) }]));
 // Automatic rollbacks in a row before giving up; the count resets on the next deploy.
 const MAX_CONSECUTIVE_ROLLBACKS = config.maxConsecutiveRollbacks ?? 2;
 // Time the alarm gets to evaluate a version after a rollback, before another one may happen.
 const COOLDOWN_MS = Number(process.env.ROLLBACK_COOLDOWN_MINUTES ?? 3) * 60_000;
 
-// The alias description records the last rollback, e.g. "auto-rollback #1 from v3 at 2026-10-01T16:00:00.000Z".
-// A deploy replaces it, which resets the count.
-const ROLLBACK_MARKER = /^(auto|manual)-rollback(?: #(\d+))? from v\d+ at (\S+)$/;
+const CURRENT_SK = 'CURRENT';
+const versionSk = (version) => `VERSION#${String(version).padStart(10, '0')}`;
+const s3Key = (functionName, version) => `${functionName}/${functionName}-${version}.zip`;
 
 export const handler = async (event) => {
   if (event.type === 'scheduled-check') {
-    return checkAlarms([...REGISTERED.values()].flatMap((alarms) => [...alarms]));
+    await syncAll();
+    return checkAlarms([...REGISTERED.values()].flatMap(({ alarms }) => [...alarms]));
+  }
+  if (event.type === 'sync') {
+    return syncAll(event.functionName);
   }
 
   const results = [];
@@ -48,6 +71,128 @@ export const handler = async (event) => {
   }
   return results;
 };
+
+// ---------------------------------------------------------------------------------------------
+// Sync: archive new versions to S3 + DynamoDB, and record alias moves made outside the system.
+// ---------------------------------------------------------------------------------------------
+
+async function syncAll(onlyFunction) {
+  const names = [...REGISTERED.keys()].filter((name) => !onlyFunction || name === onlyFunction);
+  if (onlyFunction && names.length === 0) {
+    return [skip(`${onlyFunction} is not registered for rollback (see config.json)`)];
+  }
+  const results = [];
+  for (const functionName of names) {
+    try {
+      const clients = await scopedClients(functionName);
+      results.push(await syncFunction(clients, functionName));
+    } catch (err) {
+      console.error(`Sync of ${functionName} failed: ${err.name}: ${err.message}`);
+      results.push({ functionName, synced: false, error: err.message });
+    }
+  }
+  return results;
+}
+
+async function syncFunction(clients, functionName) {
+  const { lambda, ddb } = clients;
+  const known = new Set((await queryVersions(ddb, functionName)).map((item) => item.version));
+
+  const archived = [];
+  for await (const page of paginateListVersionsByFunction({ client: lambda }, { FunctionName: functionName })) {
+    for (const { Version } of page.Versions ?? []) {
+      if (Version === '$LATEST' || known.has(Number(Version))) continue;
+      await archiveVersion(clients, functionName, Number(Version));
+      archived.push(Number(Version));
+    }
+  }
+
+  const currentVersion = await syncCurrent(clients, functionName);
+  return { functionName, synced: true, archived, currentVersion };
+}
+
+// Copies a published version's package to S3 and records its metadata.
+async function archiveVersion({ lambda, s3, ddb }, functionName, version) {
+  const { Code, Configuration } = await lambda.send(new GetFunctionCommand({
+    FunctionName: functionName,
+    Qualifier: String(version),
+  }));
+  if (Configuration.PackageType === 'Image') {
+    throw new Error(`${functionName} v${version} is a container image; only zip packages can be archived`);
+  }
+  const response = await fetch(Code.Location);
+  if (!response.ok) throw new Error(`Downloading ${functionName} v${version} failed: HTTP ${response.status}`);
+  const zip = new Uint8Array(await response.arrayBuffer());
+
+  const key = s3Key(functionName, version);
+  await s3.send(new PutObjectCommand({
+    Bucket: BUCKET_NAME,
+    Key: key,
+    Body: zip,
+    ContentType: 'application/zip',
+    Metadata: { 'code-sha256': Configuration.CodeSha256, 'function-version': String(version) },
+  }));
+
+  await ddb.send(new PutItemCommand({
+    TableName: TABLE_NAME,
+    Item: {
+      functionName: S(functionName),
+      sk: S(versionSk(version)),
+      version: N(version),
+      codeSha256: S(Configuration.CodeSha256),
+      description: S(Configuration.Description ?? ''),
+      lastModified: S(Configuration.LastModified),
+      runtime: S(Configuration.Runtime ?? ''),
+      handler: S(Configuration.Handler ?? ''),
+      memorySize: N(Configuration.MemorySize),
+      timeout: N(Configuration.Timeout),
+      codeSize: N(Configuration.CodeSize),
+      s3Bucket: S(BUCKET_NAME),
+      s3Key: S(key),
+      archivedAt: S(new Date().toISOString()),
+    },
+  }));
+  console.log(`Archived ${functionName} v${version} (${Configuration.CodeSha256}) to s3://${BUCKET_NAME}/${key}`);
+}
+
+// If the alias points somewhere the table doesn't know about, it was moved outside the rollback
+// system (a deploy, or by hand): record it as the current version and reset the rollback count.
+async function syncCurrent({ lambda, ddb }, functionName) {
+  const { alias } = REGISTERED.get(functionName);
+  const aliasVersion = Number((await lambda.send(new GetAliasCommand({
+    FunctionName: functionName,
+    Name: alias,
+  }))).FunctionVersion);
+
+  const current = await getCurrent(ddb, functionName);
+  if (current?.version === aliasVersion) return aliasVersion;
+
+  try {
+    await ddb.send(new PutItemCommand({
+      TableName: TABLE_NAME,
+      Item: {
+        functionName: S(functionName),
+        sk: S(CURRENT_SK),
+        version: N(aliasVersion),
+        ...(current ? { previousVersion: N(current.version) } : {}),
+        updatedBy: S('deploy'),
+        updatedAt: S(new Date().toISOString()),
+        rollbackCount: N(0),
+      },
+      // Don't overwrite a concurrent rollback's record.
+      ConditionExpression: current ? 'version = :seen' : 'attribute_not_exists(sk)',
+      ExpressionAttributeValues: current ? { ':seen': N(current.version) } : undefined,
+    }));
+    console.log(`${functionName}:${alias} moved to v${aliasVersion} outside the rollback system; recorded as deploy`);
+  } catch (err) {
+    if (err.name !== 'ConditionalCheckFailedException') throw err;
+  }
+  return aliasVersion;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Alarms
+// ---------------------------------------------------------------------------------------------
 
 // Scheduled re-check: treat every registered alarm still in ALARM as if it had just fired.
 async function checkAlarms(alarmNames) {
@@ -75,103 +220,155 @@ async function handleAlarm(alarm) {
     return skip(`state is ${alarm.NewStateValue}, not ALARM`);
   }
 
-  const target = targetFromAlarm(alarm);
-  if (!target) {
+  const functionName = functionFromAlarm(alarm);
+  if (!functionName) {
     return skip('alarm has no FunctionName dimension');
   }
-  const { functionName, aliasName } = target;
 
-  const { lambda, reason } = await preHook(functionName, alarm.AlarmName);
-  if (!lambda) {
+  const { clients, reason } = await preHook(functionName, alarm.AlarmName);
+  if (!clients) {
     return skip(reason);
   }
+  const { lambda, ddb } = clients;
+  const { alias: aliasName } = REGISTERED.get(functionName);
+
+  // Make sure the newest version is archived and any deploy since the last run is recorded.
+  await syncFunction(clients, functionName);
 
   const alias = await lambda.send(new GetAliasCommand({ FunctionName: functionName, Name: aliasName }));
   const currentVersion = Number(alias.FunctionVersion);
 
-  const last = lastRollback(alias.Description);
-  if (last) {
-    const sinceMs = Date.now() - last.at.getTime();
+  const state = await getCurrent(ddb, functionName);
+  if (state?.lastRollbackAt) {
+    const sinceMs = Date.now() - new Date(state.lastRollbackAt).getTime();
     if (sinceMs < COOLDOWN_MS) {
       return skip(`${functionName}:${aliasName} was rolled back ${Math.round(sinceMs / 1000)}s ago, giving the alarm time to evaluate version ${currentVersion}`);
     }
-    if (last.count >= MAX_CONSECUTIVE_ROLLBACKS) {
-      return skip(`${functionName}:${aliasName} already rolled back ${last.count} times in a row (max ${MAX_CONSECUTIVE_ROLLBACKS}), manual action needed`);
-    }
   }
-  const rollbackNumber = (last?.count ?? 0) + 1;
+  if ((state?.rollbackCount ?? 0) >= MAX_CONSECUTIVE_ROLLBACKS) {
+    return skip(`${functionName}:${aliasName} already rolled back ${state.rollbackCount} times in a row (max ${MAX_CONSECUTIVE_ROLLBACKS}), manual action needed`);
+  }
+  const rollbackNumber = (state?.rollbackCount ?? 0) + 1;
 
-  const previousVersion = await findPreviousVersion(lambda, functionName, currentVersion);
-  if (previousVersion === undefined) {
-    return skip(`${functionName}:${aliasName} is on version ${currentVersion}, no older version to roll back to`);
+  const target = await findPreviousArchived(ddb, functionName, currentVersion);
+  if (!target) {
+    return skip(`${functionName}:${aliasName} is on version ${currentVersion}, no older archived version to roll back to`);
   }
 
-  console.log(`Rolling back ${functionName}:${aliasName}: ${currentVersion} -> ${previousVersion} (automatic rollback #${rollbackNumber})`);
+  console.log(`Rolling back ${functionName}:${aliasName}: ${currentVersion} -> ${target.version} (automatic rollback #${rollbackNumber})`);
   // RevisionId makes the update fail if someone else moved the alias since we read it.
   await lambda.send(new UpdateAliasCommand({
     FunctionName: functionName,
     Name: aliasName,
-    FunctionVersion: String(previousVersion),
+    FunctionVersion: String(target.version),
     RevisionId: alias.RevisionId,
-    Description: `auto-rollback #${rollbackNumber} from v${currentVersion} at ${new Date().toISOString()}`,
   }));
 
-  const codeSha256 = await restoreLatest(lambda, functionName, previousVersion);
+  await restoreLatest(clients, functionName, target);
+  await recordRollback(ddb, functionName, {
+    from: currentVersion,
+    to: target.version,
+    by: 'auto-rollback',
+    rollbackCount: rollbackNumber,
+    reason: `alarm ${alarm.AlarmName}`,
+  });
 
-  return { rolledBack: true, functionName, aliasName, from: currentVersion, to: previousVersion, rollbackNumber, latestCodeSha256: codeSha256 };
+  return {
+    rolledBack: true,
+    functionName,
+    aliasName,
+    from: currentVersion,
+    to: target.version,
+    rollbackNumber,
+    restoredFrom: `s3://${target.s3Bucket}/${target.s3Key}`,
+  };
 }
 
-// Parses the marker left in the alias description by the last rollback, if any.
-// Manual rollbacks (from the workflow) start the cooldown but don't count towards the limit.
-function lastRollback(description) {
-  const match = ROLLBACK_MARKER.exec(description ?? '');
-  if (!match) return undefined;
-  const at = new Date(match[3]);
-  if (Number.isNaN(at.getTime())) return undefined;
-  return { count: match[1] === 'auto' ? Number(match[2] ?? 1) : 0, at };
+// Single-metric alarms carry Trigger.Dimensions; metric-math alarms carry one
+// Trigger.Metrics[].MetricStat.Metric.Dimensions per input metric.
+function functionFromAlarm(alarm) {
+  const trigger = alarm.Trigger ?? {};
+  const dimensionSets = [
+    trigger.Dimensions,
+    ...(trigger.Metrics ?? []).map((m) => m.MetricStat?.Metric?.Dimensions),
+  ].filter(Boolean);
+  return dimensionSets
+    .flatMap((dims) => dims.filter((d) => (d.name ?? d.Name) === 'FunctionName'))
+    .map((d) => d.value ?? d.Value)[0];
 }
 
-// Uploads the given version's existing package as $LATEST, so unqualified calls run it too.
-// Only code is restored; $LATEST keeps its current configuration. No new version is published.
-async function restoreLatest(lambda, functionName, version) {
-  const { Code, Configuration } = await lambda.send(new GetFunctionCommand({
-    FunctionName: functionName,
-    Qualifier: String(version),
-  }));
-  const response = await fetch(Code.Location);
-  if (!response.ok) throw new Error(`Downloading version ${version} package failed: HTTP ${response.status}`);
-  const zip = new Uint8Array(await response.arrayBuffer());
+// ---------------------------------------------------------------------------------------------
+// Rollback steps
+// ---------------------------------------------------------------------------------------------
 
-  console.log(`Restoring $LATEST of ${functionName} to the package of version ${version} (${Configuration.CodeSha256})`);
+// Lambda pulls the archived zip from S3 itself; it becomes $LATEST's code, no version is published.
+// Only code is restored; $LATEST keeps its current configuration.
+async function restoreLatest({ lambda }, functionName, target) {
+  console.log(`Restoring $LATEST of ${functionName} from s3://${target.s3Bucket}/${target.s3Key}`);
   const updated = await lambda.send(new UpdateFunctionCodeCommand({
     FunctionName: functionName,
-    ZipFile: zip,
+    S3Bucket: target.s3Bucket,
+    S3Key: target.s3Key,
     Publish: false,
   }));
   await waitUntilFunctionUpdatedV2({ client: lambda, maxWaitTime: 60 }, { FunctionName: functionName });
 
-  if (updated.CodeSha256 !== Configuration.CodeSha256) {
-    throw new Error(`$LATEST code hash ${updated.CodeSha256} does not match version ${version} (${Configuration.CodeSha256})`);
+  if (updated.CodeSha256 !== target.codeSha256) {
+    throw new Error(`$LATEST code hash ${updated.CodeSha256} does not match version ${target.version} (${target.codeSha256})`);
   }
-  console.log(`$LATEST of ${functionName} now runs the code of version ${version}`);
-  return updated.CodeSha256;
+  console.log(`$LATEST of ${functionName} now runs the code of version ${target.version}`);
 }
 
+async function recordRollback(ddb, functionName, { from, to, by, rollbackCount, reason }) {
+  const now = new Date().toISOString();
+  await ddb.send(new PutItemCommand({
+    TableName: TABLE_NAME,
+    Item: {
+      functionName: S(functionName),
+      sk: S(CURRENT_SK),
+      version: N(to),
+      previousVersion: N(from),
+      updatedBy: S(by),
+      updatedAt: S(now),
+      lastRollbackAt: S(now),
+      rollbackCount: N(rollbackCount),
+    },
+  }));
+  try {
+    await ddb.send(new UpdateItemCommand({
+      TableName: TABLE_NAME,
+      Key: { functionName: S(functionName), sk: S(versionSk(from)) },
+      UpdateExpression: 'SET rolledBackAt = :at, rolledBackBy = :by, rollbackReason = :reason',
+      ConditionExpression: 'attribute_exists(sk)',
+      ExpressionAttributeValues: { ':at': S(now), ':by': S(by), ':reason': S(reason) },
+    }));
+  } catch (err) {
+    if (err.name !== 'ConditionalCheckFailedException') throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pre-hook and scoped credentials
+// ---------------------------------------------------------------------------------------------
+
 // Runs before any rollback: checks the function is registered in config.json and the alarm
-// is one of its registered alarms. If so, returns a Lambda client whose credentials can touch
-// only that one function; otherwise returns the reason to skip.
-// This function's own role has no Lambda permissions; it can only assume the rollback role,
-// and the session policy narrows that role down to the target function.
+// is one of its registered alarms. If so, returns clients whose credentials can touch only that
+// one function (and its S3 folder and DynamoDB items); otherwise returns the reason to skip.
 async function preHook(functionName, alarmName) {
-  const alarms = REGISTERED.get(functionName);
-  if (!alarms) {
+  const registration = REGISTERED.get(functionName);
+  if (!registration) {
     return { reason: `${functionName} is not registered for rollback (see config.json)` };
   }
-  if (!alarms.has(alarmName)) {
+  if (!registration.alarms.has(alarmName)) {
     return { reason: `alarm '${alarmName}' is not registered for ${functionName} (see config.json)` };
   }
   console.log(`Pre-hook: ${functionName} found in config.json with alarm '${alarmName}', rollback enabled`);
+  return { clients: await scopedClients(functionName) };
+}
 
+// This function's own role has no Lambda, S3 or DynamoDB permissions; it can only assume the
+// rollback role, and the session policy narrows that role down to one function.
+async function scopedClients(functionName) {
   const functionArn = `${FUNCTION_ARN_PREFIX}${functionName}`;
   const { Credentials } = await sts.send(new AssumeRoleCommand({
     RoleArn: ROLLBACK_ROLE_ARN,
@@ -179,67 +376,112 @@ async function preHook(functionName, alarmName) {
     DurationSeconds: 900,
     Policy: JSON.stringify({
       Version: '2012-10-17',
-      Statement: [{
-        Effect: 'Allow',
-        Action: [
-          'lambda:GetAlias',
-          'lambda:ListVersionsByFunction',
-          'lambda:UpdateAlias',
-          'lambda:GetFunction',
-          'lambda:UpdateFunctionCode',
-        ],
-        Resource: [functionArn, `${functionArn}:*`],
-      }],
+      Statement: [
+        {
+          Effect: 'Allow',
+          Action: [
+            'lambda:GetAlias',
+            'lambda:ListVersionsByFunction',
+            'lambda:UpdateAlias',
+            'lambda:GetFunction',
+            'lambda:UpdateFunctionCode',
+          ],
+          Resource: [functionArn, `${functionArn}:*`],
+        },
+        {
+          Effect: 'Allow',
+          Action: ['s3:GetObject', 's3:PutObject'],
+          Resource: `arn:aws:s3:::${BUCKET_NAME}/${functionName}/*`,
+        },
+        {
+          Effect: 'Allow',
+          Action: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:Query'],
+          Resource: TABLE_ARN,
+          Condition: { 'ForAllValues:StringEquals': { 'dynamodb:LeadingKeys': [functionName] } },
+        },
+      ],
     }),
   }));
-  console.log(`Pre-hook: using credentials scoped to ${functionArn}`);
+  console.log(`Using credentials scoped to ${functionArn}`);
 
-  const lambda = new LambdaClient({
-    credentials: {
-      accessKeyId: Credentials.AccessKeyId,
-      secretAccessKey: Credentials.SecretAccessKey,
-      sessionToken: Credentials.SessionToken,
-      expiration: Credentials.Expiration,
-    },
+  const credentials = {
+    accessKeyId: Credentials.AccessKeyId,
+    secretAccessKey: Credentials.SecretAccessKey,
+    sessionToken: Credentials.SessionToken,
+    expiration: Credentials.Expiration,
+  };
+  return {
+    lambda: new LambdaClient({ credentials }),
+    s3: new S3Client({ credentials }),
+    ddb: new DynamoDBClient({ credentials }),
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// DynamoDB helpers
+// ---------------------------------------------------------------------------------------------
+
+async function getCurrent(ddb, functionName) {
+  const { Item } = await ddb.send(new GetItemCommand({
+    TableName: TABLE_NAME,
+    Key: { functionName: S(functionName), sk: S(CURRENT_SK) },
+    ConsistentRead: true,
+  }));
+  if (!Item) return undefined;
+  return {
+    version: Number(Item.version.N),
+    rollbackCount: Number(Item.rollbackCount?.N ?? 0),
+    lastRollbackAt: Item.lastRollbackAt?.S,
+    updatedBy: Item.updatedBy?.S,
+  };
+}
+
+async function queryVersions(ddb, functionName) {
+  const items = [];
+  const pages = paginateQuery({ client: ddb }, {
+    TableName: TABLE_NAME,
+    KeyConditionExpression: 'functionName = :f AND begins_with(sk, :prefix)',
+    ExpressionAttributeValues: { ':f': S(functionName), ':prefix': S('VERSION#') },
+    ProjectionExpression: 'version',
+    ConsistentRead: true,
   });
-  return { lambda };
-}
-
-// Single-metric alarms carry Trigger.Dimensions; metric-math alarms carry one
-// Trigger.Metrics[].MetricStat.Metric.Dimensions per input metric.
-// FunctionName=<fn>, Resource=<fn> | <fn>:<alias> | <fn>:$LATEST | <fn>:<version>.
-function targetFromAlarm(alarm) {
-  const trigger = alarm.Trigger ?? {};
-  const dimensionSets = [
-    trigger.Dimensions,
-    ...(trigger.Metrics ?? []).map((m) => m.MetricStat?.Metric?.Dimensions),
-  ].filter(Boolean);
-  const values = (name) => dimensionSets.flatMap((dims) =>
-    dims.filter((d) => (d.name ?? d.Name) === name).map((d) => d.value ?? d.Value));
-
-  const functionName = values('FunctionName')[0];
-  if (!functionName) return undefined;
-
-  // Use an alias from the Resource dimension if there is one; $LATEST and numbered
-  // versions can't be moved, so errors there roll back the default alias.
-  const aliasName = values('Resource')
-    .map((resource) => resource.split(':')[1])
-    .find((qualifier) => qualifier && qualifier !== '$LATEST' && !/^\d+$/.test(qualifier))
-    ?? DEFAULT_ALIAS;
-  return { functionName, aliasName };
-}
-
-// Highest published version lower than the current one.
-async function findPreviousVersion(lambda, functionName, currentVersion) {
-  let previous;
-  for await (const page of paginateListVersionsByFunction({ client: lambda }, { FunctionName: functionName })) {
-    for (const { Version } of page.Versions ?? []) {
-      if (Version === '$LATEST') continue;
-      const v = Number(Version);
-      if (v < currentVersion && (previous === undefined || v > previous)) previous = v;
-    }
+  for await (const page of pages) {
+    for (const item of page.Items ?? []) items.push({ version: Number(item.version.N) });
   }
-  return previous;
+  return items;
+}
+
+// Highest archived version lower than the current one.
+async function findPreviousArchived(ddb, functionName, currentVersion) {
+  if (currentVersion <= 1) return undefined;
+  const { Items = [] } = await ddb.send(new QueryCommand({
+    TableName: TABLE_NAME,
+    KeyConditionExpression: 'functionName = :f AND sk BETWEEN :low AND :high',
+    ExpressionAttributeValues: {
+      ':f': S(functionName),
+      ':low': S(versionSk(0)),
+      ':high': S(versionSk(currentVersion - 1)),
+    },
+    ScanIndexForward: false,
+    Limit: 1,
+    ConsistentRead: true,
+  }));
+  const item = Items[0];
+  if (!item) return undefined;
+  return {
+    version: Number(item.version.N),
+    codeSha256: item.codeSha256.S,
+    s3Bucket: item.s3Bucket.S,
+    s3Key: item.s3Key.S,
+  };
+}
+
+function S(value) {
+  return { S: String(value ?? '') };
+}
+
+function N(value) {
+  return { N: String(value) };
 }
 
 function skip(reason) {
