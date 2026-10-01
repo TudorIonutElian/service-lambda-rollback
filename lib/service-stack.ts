@@ -1,5 +1,7 @@
 import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as sns from 'aws-cdk-lib/aws-sns';
@@ -52,6 +54,19 @@ export class ServiceStack extends cdk.Stack {
     }));
 
     rollbackTopic.addSubscription(new subscriptions.LambdaSubscription(rollbackFn));
+
+    // Errors on the alias (not the bare function), so the alarm carries
+    // FunctionName and Resource=<fn>:<alias> dimensions the rollback function reads.
+    const errorsAlarm = new cloudwatch.Alarm(this, 'LiveErrorsAlarm', {
+      alarmName: `${FUNCTION_NAME}-${ALIAS_NAME}-errors`,
+      alarmDescription: `Errors on ${FUNCTION_NAME}:${ALIAS_NAME}; triggers automatic rollback`,
+      metric: alias.metricErrors({ period: cdk.Duration.minutes(1), statistic: cloudwatch.Stats.SUM }),
+      threshold: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      evaluationPeriods: 1,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    errorsAlarm.addAlarmAction(new cloudwatchActions.SnsAction(rollbackTopic));
 
     new cdk.CfnOutput(this, 'FunctionName', { value: fn.functionName });
     new cdk.CfnOutput(this, 'AliasArn', { value: alias.functionArn });
