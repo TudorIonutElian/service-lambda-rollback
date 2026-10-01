@@ -15,21 +15,76 @@ on:
 
 permissions:
   contents: read
-
-concurrency:
-  group: service-lambda-release
-  cancel-in-progress: false
+  # Read workflow runs, to stop if a deploy is running or queued.
+  actions: read
 
 env:
   FUNCTION_NAME: service-lambda
   ALIAS_NAME: live
   ROLLBACK_FUNCTION_NAME: service-lambda-rollback
   TABLE_NAME: service-lambda-rollback-versions
+  # Workflows whose running or queued runs block a rollback.
+  DEPLOY_WORKFLOWS: deploy.yml deploy-branch.yml
 
 jobs:
-  rollback:
+  # Runs outside the release lock, so it can stop straight away instead of waiting for the deploy
+  # to finish and then rolling back over it.
+  check-deploys:
     runs-on: ubuntu-latest
     steps:
+      - name: Stop if a deploy is running or queued
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          ACTIVE=$(for workflow in $DEPLOY_WORKFLOWS; do
+            gh run list --repo "$GITHUB_REPOSITORY" --workflow "$workflow" --limit 20 \
+              --json status,workflowName,headBranch,url \
+              --jq '.[] | select(.status != "completed") | "\(.workflowName) (\(.status)) on \(.headBranch): \(.url)"'
+          done)
+          if [[ -z "$ACTIVE" ]]; then
+            echo "No deploy running or queued."
+            exit 0
+          fi
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "::warning::A deploy is running or queued; the dry run's version list may change once it finishes."
+            echo "$ACTIVE"
+            exit 0
+          fi
+          echo "::error::A deploy is running or queued, so the rollback was stopped. Re-run it once the deploy has finished."
+          echo "$ACTIVE"
+          { echo "**Rollback stopped:** a deploy is running or queued."; echo; sed 's/^/- /' <<<"$ACTIVE"; } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+  rollback:
+    needs: check-deploys
+    runs-on: ubuntu-latest
+    # Shared with the deploy workflows: a deploy started after this job has the lock waits for it.
+    concurrency:
+      group: service-lambda-release
+      cancel-in-progress: false
+    steps:
+      # Same check again, now holding the lock: catches a deploy queued since check-deploys ran.
+      - name: Stop if a deploy is running or queued
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ACTIVE=$(for workflow in $DEPLOY_WORKFLOWS; do
+            gh run list --repo "$GITHUB_REPOSITORY" --workflow "$workflow" --limit 20 \
+              --json status,workflowName,headBranch,url \
+              --jq '.[] | select(.status != "completed") | "\(.workflowName) (\(.status)) on \(.headBranch): \(.url)"'
+          done)
+          if [[ -n "$ACTIVE" ]]; then
+            echo "::error::A deploy is running or queued, so the rollback was stopped. Re-run it once the deploy has finished."
+            echo "$ACTIVE"
+            { echo "**Rollback stopped:** a deploy is running or queued."; echo; sed 's/^/- /' <<<"$ACTIVE"; } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "No deploy running or queued."
+
       - uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -143,10 +198,10 @@ jobs:
           aws dynamodb update-item --table-name "$TABLE_NAME" \
             --key "$(jq -n --arg fn "$FUNCTION_NAME" --arg sk "$(printf 'VERSION#%010d' "$CURRENT_VERSION")" \
               '{functionName: {S: $fn}, sk: {S: $sk}}')" \
-            --update-expression 'SET rolledBackAt = :at, rolledBackBy = :by, rollbackReason = :reason' \
+            --update-expression 'SET rolledBackAt = :at, rolledBackBy = :by, rollbackReason = :reason, stable = :false' \
             --condition-expression 'attribute_exists(sk)' \
             --expression-attribute-values "$(jq -n --arg now "$NOW" --arg actor "$GITHUB_ACTOR" \
-              '{":at": {S: $now}, ":by": {S: "manual-rollback"}, ":reason": {S: ("GitHub Actions by " + $actor)}}')" \
+              '{":at": {S: $now}, ":by": {S: "manual-rollback"}, ":reason": {S: ("GitHub Actions by " + $actor)}, ":false": {BOOL: false}}')" \
             || echo "::warning::Version $CURRENT_VERSION is not archived; it was not marked as rolled back."
 
           echo "Rolled back \`$FUNCTION_NAME:$ALIAS_NAME\` from version **$CURRENT_VERSION** to **$TARGET_VERSION**, and restored \`\$LATEST\` from \`s3://$TARGET_BUCKET/$TARGET_KEY\` (\`$TARGET_SHA\`)." \

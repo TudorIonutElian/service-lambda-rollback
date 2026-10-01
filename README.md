@@ -43,6 +43,11 @@ CloudWatch only notifies when an alarm changes state. If the version rolled back
 alarm stays in `ALARM`, so the EventBridge rule `service-lambda-rollback-check` re-checks registered
 alarms every 5 minutes and rolls back again if needed.
 
+**Stable versions.** On the same 5-minute check, if all of a function's registered alarms are `OK`
+and its live version has been live for at least 5 minutes (`STABLE_AFTER_MINUTES`), that version is
+marked stable: `stable: true` and `stableAt` on both the `CURRENT` item and the version's own item.
+A version that is later rolled back from gets `stable: false`.
+
 **Manual rollback.** The `Rollback` GitHub Actions workflow syncs, then does the same with the AWS CLI.
 Leave `target_version` empty to go back one version, or enter a specific version. Tick `dry_run` to
 only list the archived versions (commit description, code hash, S3 key, whether it was rolled back)
@@ -54,8 +59,8 @@ Table `service-lambda-rollback-versions`, partition key `functionName`, sort key
 
 | `sk` | Attributes |
 |---|---|
-| `VERSION#0000000003` | `version`, `codeSha256`, `description`, `lastModified`, `runtime`, `handler`, `memorySize`, `timeout`, `codeSize`, `s3Bucket`, `s3Key`, `archivedAt`; after a rollback away from it: `rolledBackAt`, `rolledBackBy`, `rollbackReason` |
-| `CURRENT` | `version` the alias points to, `previousVersion`, `updatedBy` (`deploy` / `auto-rollback` / `manual-rollback`), `updatedAt`, `lastRollbackAt`, `rollbackCount` |
+| `VERSION#0000000003` | `version`, `codeSha256`, `description`, `lastModified`, `runtime`, `handler`, `memorySize`, `timeout`, `codeSize`, `s3Bucket`, `s3Key`, `archivedAt`; once its alarms stayed OK while live: `stable`, `stableAt`; after a rollback away from it: `rolledBackAt`, `rolledBackBy`, `rollbackReason`, `stable: false` |
+| `CURRENT` | `version` the alias points to, `previousVersion`, `updatedBy` (`deploy` / `auto-rollback` / `manual-rollback`), `updatedAt`, `lastRollbackAt`, `rollbackCount`, `stable`, `stableAt` |
 
 The S3 bucket and the table are kept if the stack is deleted (`RemovalPolicy.RETAIN`).
 
@@ -77,7 +82,7 @@ The S3 bucket and the table are kept if the stack is deleted (`RemovalPolicy.RET
 |---|---|---|
 | `Deploy` | Push to `main` (except `.md` / `docs/` only changes), or manual | `cdk deploy`, then sync |
 | `Deploy branch` | Manual, choose a branch | `cdk deploy` from that branch, then sync |
-| `Rollback` | Manual, inputs `target_version` and `dry_run` | Sync, then move `live` back and restore `$LATEST` from S3; dry run only lists versions |
+| `Rollback` | Manual, inputs `target_version` and `dry_run` | Stops if a `Deploy` / `Deploy branch` run is running or queued; otherwise syncs, then moves `live` back and restores `$LATEST` from S3. Dry run only lists versions (and only warns about deploys) |
 
 All three need these GitHub repository secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 `AWS_REGION`.

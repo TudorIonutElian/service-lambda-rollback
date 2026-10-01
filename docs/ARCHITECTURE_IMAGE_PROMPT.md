@@ -53,7 +53,7 @@ GROUP B — "Detection":
     "FILL(live,0) + FILL(unqualified,0) + FILL(latest,0) ≥ 1 in 1 minute".
   - An SNS icon labelled "SNS topic: service-lambda-rollback-notifications".
   - An EventBridge icon labelled "EventBridge rule (default bus): service-lambda-rollback-check"
-    with caption "rate(5 minutes): sync + re-check alarms".
+    with caption "rate(5 minutes): sync, mark stable if alarms OK, re-check alarms".
 
 GROUP C — "Rollback":
   - A Lambda icon labelled "service-lambda-rollback".
@@ -73,8 +73,8 @@ GROUP C — "Rollback":
 GROUP D — "Version archive":
   - A DynamoDB icon labelled "DynamoDB: service-lambda-rollback-versions".
     Next to it, a small table sketch with two rows:
-      "functionName | sk = VERSION#0000000003 | codeSha256, description, runtime, s3Key, rolledBackBy…"
-      "functionName | sk = CURRENT | version, previousVersion, updatedBy, lastRollbackAt, rollbackCount"
+      "functionName | sk = VERSION#0000000003 | codeSha256, description, runtime, s3Key, stable, rolledBackBy…"
+      "functionName | sk = CURRENT | version, previousVersion, updatedBy, lastRollbackAt, rollbackCount, stable"
   - An S3 bucket icon labelled "S3: service-lambda-rollback-artifacts-<account>-<region>".
     Inside or under it, three small zip-file icons labelled
     "service-lambda/service-lambda-1.zip", "service-lambda/service-lambda-2.zip",
@@ -180,7 +180,7 @@ What actually exists in this repository, to check the generated image against.
 2. **Sync / archive:** for each registered function, new versions are downloaded from Lambda and stored as `<fn>/<fn>-<version>.zip` in S3, with their metadata in DynamoDB (`VERSION#…`). If the alias moved outside the rollback system, `CURRENT` is updated as a deploy and the rollback count resets.
 3. **Detect:** errors from `service-lambda:live` or `$LATEST` raise `service-lambda-errors` to `ALARM`.
 4. **Notify:** the alarm publishes to the SNS topic on `OK → ALARM`, which invokes `service-lambda-rollback`.
-5. **Re-check:** every 5 minutes EventBridge invokes `service-lambda-rollback`, which syncs, reads the registered alarms (`DescribeAlarms`) and treats any still in `ALARM` as if it had just fired.
+5. **Re-check:** every 5 minutes EventBridge invokes `service-lambda-rollback`, which syncs, reads the registered alarms (`DescribeAlarms`) and treats any still in `ALARM` as if it had just fired. If all of a function's alarms are `OK` and its live version has been live for 5+ minutes, that version is marked `stable` on `CURRENT` and on its `VERSION#…` item.
 6. **Pre-hook:** the function must be registered and enabled in `config.json`, and the alarm must be registered for it.
 7. **Scoped credentials:** STS `AssumeRole` on `RollbackExecutionRole`, with a session policy limited to that one function, its S3 folder and its DynamoDB items.
 8. **Guards:** from the `CURRENT` item, the 3-minute cooldown must have passed and the consecutive-rollback limit must not be reached.
