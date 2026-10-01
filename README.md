@@ -77,7 +77,7 @@ The S3 bucket and the table are kept if the stack is deleted (`RemovalPolicy.RET
 |---|---|---|
 | `Deploy` | Push to `main` (except `.md` / `docs/` only changes), or manual | `cdk deploy`, then sync |
 | `Deploy branch` | Manual, choose a branch | `cdk deploy` from that branch, then sync |
-| `Rollback` | Manual, inputs `target_version` and `dry_run` | Sync, then move `live` back and restore `$LATEST` from S3; dry run only lists versions |
+| `Rollback` | Manual, inputs `target_version` and `dry_run` | Stops if a `Deploy` / `Deploy branch` run is running or queued; otherwise syncs, then moves `live` back and restores `$LATEST` from S3. Dry run only lists versions (and only warns about deploys) |
 
 All three need these GitHub repository secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 `AWS_REGION`.
