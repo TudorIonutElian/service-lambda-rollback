@@ -23,6 +23,8 @@ export const VERSIONS_TABLE_NAME = 'service-lambda-rollback-versions';
 export const ROLLBACK_CHECK_INTERVAL_MINUTES = 5;
 // Minimum time between two rollbacks of the same alias, so the alarm can judge the new version.
 export const ROLLBACK_COOLDOWN_MINUTES = 3;
+// How long a version must be live, with all its alarms OK, before the scheduled check marks it stable.
+export const STABLE_AFTER_MINUTES = 5;
 
 // Describes the code a published version contains: the last commit that touched lambda/.
 // It only changes when the function code changes, so it never forces a new version on its own.
@@ -105,6 +107,7 @@ export class ServiceStack extends cdk.Stack {
         TABLE_ARN: versionsTable.tableArn,
         BUCKET_NAME: artifactsBucket.bucketName,
         ROLLBACK_COOLDOWN_MINUTES: String(ROLLBACK_COOLDOWN_MINUTES),
+        STABLE_AFTER_MINUTES: String(STABLE_AFTER_MINUTES),
         FUNCTION_ARN_PREFIX: `arn:${cdk.Aws.PARTITION}:lambda:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:function:`,
       },
     });

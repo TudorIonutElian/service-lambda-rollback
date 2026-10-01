@@ -2,8 +2,9 @@
 //
 // Invoked by:
 //   - SNS, when a registered CloudWatch alarm goes into ALARM;
-//   - EventBridge every few minutes ({ type: 'scheduled-check' }): syncs metadata and re-checks
-//     alarms still in ALARM (CloudWatch only notifies on state changes);
+//   - EventBridge every few minutes ({ type: 'scheduled-check' }): syncs metadata, marks the live
+//     version stable when all its alarms are OK, and re-checks alarms still in ALARM (CloudWatch
+//     only notifies on state changes);
 //   - the deploy workflows after `cdk deploy` ({ type: 'sync' }).
 //
 // Sync keeps a DynamoDB record of every published version and copies each version's package to S3
@@ -55,6 +56,8 @@ const REGISTERED = new Map((config.functions ?? [])
   }]));
 // Time the alarm gets to evaluate a version after a rollback, before another one may happen.
 const COOLDOWN_MS = Number(process.env.ROLLBACK_COOLDOWN_MINUTES ?? 3) * 60_000;
+// How long a version must have been live, with all its alarms OK, before it is marked stable.
+const STABLE_AFTER_MS = Number(process.env.STABLE_AFTER_MINUTES ?? 5) * 60_000;
 
 const CURRENT_SK = 'CURRENT';
 const versionSk = (version) => `VERSION#${String(version).padStart(10, '0')}`;
@@ -63,7 +66,10 @@ const s3Key = (functionName, version) => `${functionName}/${functionName}-${vers
 export const handler = async (event) => {
   if (event.type === 'scheduled-check') {
     await syncAll();
-    return checkAlarms([...REGISTERED.values()].flatMap(({ alarms }) => [...alarms]));
+    const alarms = await describeRegisteredAlarms();
+    const stable = await markStable(alarms);
+    const rollbacks = await checkAlarms(alarms);
+    return [...stable, ...rollbacks];
   }
   if (event.type === 'sync') {
     return syncAll(event.functionName);
@@ -199,12 +205,78 @@ async function syncCurrent({ lambda, ddb }, functionName) {
 // Alarms
 // ---------------------------------------------------------------------------------------------
 
-// Scheduled re-check: treat every registered alarm still in ALARM as if it had just fired.
-async function checkAlarms(alarmNames) {
+async function describeRegisteredAlarms() {
+  const alarmNames = [...REGISTERED.values()].flatMap(({ alarms }) => [...alarms]);
   if (alarmNames.length === 0) return [];
   const { MetricAlarms = [] } = await cloudwatch.send(new DescribeAlarmsCommand({ AlarmNames: alarmNames }));
+  return MetricAlarms;
+}
+
+// Scheduled check: a function whose registered alarms are all OK, and whose live version has been
+// live for at least STABLE_AFTER_MINUTES, gets that version marked stable, both on CURRENT and on
+// the version's own item. Done once per version (until it is rolled back from).
+async function markStable(alarms) {
+  const states = new Map(alarms.map((alarm) => [alarm.AlarmName, alarm.StateValue]));
   const results = [];
-  for (const alarm of MetricAlarms) {
+  for (const [functionName, { alarms: registered }] of REGISTERED) {
+    if (registered.size === 0) continue;
+    const notOk = [...registered].filter((name) => states.get(name) !== 'OK');
+    if (notOk.length > 0) {
+      console.log(`${functionName}: not stable, alarms not OK: ${notOk.map((name) => `${name}=${states.get(name) ?? 'missing'}`).join(', ')}`);
+      continue;
+    }
+    try {
+      const { ddb } = await scopedClients(functionName);
+      const current = await getCurrent(ddb, functionName);
+      if (!current || current.stable) continue;
+      const liveForMs = Date.now() - new Date(current.updatedAt).getTime();
+      if (!(liveForMs >= STABLE_AFTER_MS)) {
+        console.log(`${functionName}: v${current.version} live for ${Math.round(liveForMs / 1000)}s, not marked stable yet`);
+        continue;
+      }
+      results.push(await recordStable(ddb, functionName, current.version));
+    } catch (err) {
+      console.error(`Marking ${functionName} stable failed: ${err.name}: ${err.message}`);
+      results.push({ functionName, stable: false, error: err.message });
+    }
+  }
+  return results;
+}
+
+async function recordStable(ddb, functionName, version) {
+  const now = new Date().toISOString();
+  try {
+    // Only if CURRENT still points at this version (a rollback may have just moved it).
+    await ddb.send(new UpdateItemCommand({
+      TableName: TABLE_NAME,
+      Key: { functionName: S(functionName), sk: S(CURRENT_SK) },
+      UpdateExpression: 'SET stable = :true, stableAt = :now',
+      ConditionExpression: 'version = :version',
+      ExpressionAttributeValues: { ':true': { BOOL: true }, ':now': S(now), ':version': N(version) },
+    }));
+  } catch (err) {
+    if (err.name !== 'ConditionalCheckFailedException') throw err;
+    return { functionName, version, stable: false, reason: 'live version changed' };
+  }
+  try {
+    await ddb.send(new UpdateItemCommand({
+      TableName: TABLE_NAME,
+      Key: { functionName: S(functionName), sk: S(versionSk(version)) },
+      UpdateExpression: 'SET stable = :true, stableAt = :now',
+      ConditionExpression: 'attribute_exists(sk)',
+      ExpressionAttributeValues: { ':true': { BOOL: true }, ':now': S(now) },
+    }));
+  } catch (err) {
+    if (err.name !== 'ConditionalCheckFailedException') throw err;
+  }
+  console.log(`${functionName}: all alarms OK, v${version} marked stable`);
+  return { functionName, version, stable: true };
+}
+
+// Scheduled re-check: treat every registered alarm still in ALARM as if it had just fired.
+async function checkAlarms(alarms) {
+  const results = [];
+  for (const alarm of alarms) {
     console.log(`Scheduled check: alarm '${alarm.AlarmName}' is ${alarm.StateValue}`);
     if (alarm.StateValue !== 'ALARM') {
       results.push(skip(`alarm '${alarm.AlarmName}' is ${alarm.StateValue}`));
@@ -343,9 +415,9 @@ async function recordRollback(ddb, functionName, { from, to, by, rollbackCount, 
     await ddb.send(new UpdateItemCommand({
       TableName: TABLE_NAME,
       Key: { functionName: S(functionName), sk: S(versionSk(from)) },
-      UpdateExpression: 'SET rolledBackAt = :at, rolledBackBy = :by, rollbackReason = :reason',
+      UpdateExpression: 'SET rolledBackAt = :at, rolledBackBy = :by, rollbackReason = :reason, stable = :false',
       ConditionExpression: 'attribute_exists(sk)',
-      ExpressionAttributeValues: { ':at': S(now), ':by': S(by), ':reason': S(reason) },
+      ExpressionAttributeValues: { ':at': S(now), ':by': S(by), ':reason': S(reason), ':false': { BOOL: false } },
     }));
   } catch (err) {
     if (err.name !== 'ConditionalCheckFailedException') throw err;
@@ -438,6 +510,8 @@ async function getCurrent(ddb, functionName) {
     rollbackCount: Number(Item.rollbackCount?.N ?? 0),
     lastRollbackAt: Item.lastRollbackAt?.S,
     updatedBy: Item.updatedBy?.S,
+    updatedAt: Item.updatedAt?.S,
+    stable: Item.stable?.BOOL === true,
   };
 }
 
