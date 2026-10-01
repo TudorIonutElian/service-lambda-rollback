@@ -1,7 +1,10 @@
+import { execSync } from 'child_process';
 import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as sns from 'aws-cdk-lib/aws-sns';
@@ -13,10 +16,27 @@ export const FUNCTION_NAME = 'service-lambda';
 export const ALIAS_NAME = 'live';
 export const ROLLBACK_FUNCTION_NAME = 'service-lambda-rollback';
 export const ROLLBACK_TOPIC_NAME = 'service-lambda-rollback-notifications';
+// How often EventBridge re-checks alarms that are still in ALARM.
+export const ROLLBACK_CHECK_INTERVAL_MINUTES = 5;
+// Minimum time between two rollbacks of the same alias, so the alarm can judge the new version.
+export const ROLLBACK_COOLDOWN_MINUTES = 3;
+
+// Describes the code a published version contains: the last commit that touched lambda/.
+// It only changes when the function code changes, so it never forces a new version on its own.
+function versionDescription(): string {
+  try {
+    const commit = execSync('git log -1 --format="%h %s" -- lambda/', { encoding: 'utf8' }).trim();
+    return commit ? commit.slice(0, 256) : 'uncommitted';
+  } catch {
+    return 'unknown (no git)';
+  }
+}
 
 export class ServiceStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
+
+    const description = versionDescription();
 
     const fn = new lambda.Function(this, 'ServiceFunction', {
       functionName: FUNCTION_NAME,
@@ -24,7 +44,10 @@ export class ServiceStack extends cdk.Stack {
       handler: 'index.handler',
       code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda')),
       // Keep old versions when a new one is published, so rollback has something to point at.
-      currentVersionOptions: { removalPolicy: cdk.RemovalPolicy.RETAIN },
+      currentVersionOptions: {
+        removalPolicy: cdk.RemovalPolicy.RETAIN,
+        description,
+      },
     });
 
     // Every deploy with a code/config change publishes a new immutable version
@@ -32,6 +55,8 @@ export class ServiceStack extends cdk.Stack {
     const alias = new lambda.Alias(this, 'LiveAlias', {
       aliasName: ALIAS_NAME,
       version: fn.currentVersion,
+      // Replaces any rollback marker the rollback function left, resetting its rollback count.
+      description: `deployed ${description}`.slice(0, 256),
     });
 
     // Alarms publish here; the rollback function moves the erroring alias back one version.
@@ -48,6 +73,7 @@ export class ServiceStack extends cdk.Stack {
       timeout: cdk.Duration.minutes(2),
       environment: {
         DEFAULT_ALIAS: ALIAS_NAME,
+        ROLLBACK_COOLDOWN_MINUTES: String(ROLLBACK_COOLDOWN_MINUTES),
         FUNCTION_ARN_PREFIX: `arn:${cdk.Aws.PARTITION}:lambda:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:function:`,
       },
     });
@@ -107,6 +133,25 @@ export class ServiceStack extends cdk.Stack {
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
     errorsAlarm.addAlarmAction(new cloudwatchActions.SnsAction(rollbackTopic));
+
+    // CloudWatch only notifies when the alarm changes state. If the version we rolled back to
+    // also fails, the alarm just stays in ALARM; this schedule catches that and rolls back again
+    // (subject to the cooldown and maxConsecutiveRollbacks in lambda-rollback/config.json).
+    new events.Rule(this, 'RollbackCheckSchedule', {
+      ruleName: `${ROLLBACK_FUNCTION_NAME}-check`,
+      description: `Every ${ROLLBACK_CHECK_INTERVAL_MINUTES} min, roll back again if ${errorsAlarm.alarmName} is still in ALARM`,
+      schedule: events.Schedule.rate(cdk.Duration.minutes(ROLLBACK_CHECK_INTERVAL_MINUTES)),
+      targets: [new targets.LambdaFunction(rollbackFn, {
+        event: events.RuleTargetInput.fromObject({
+          type: 'scheduled-check',
+          alarmNames: [errorsAlarm.alarmName],
+        }),
+      })],
+    });
+    rollbackFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['cloudwatch:DescribeAlarms'],
+      resources: [errorsAlarm.alarmArn],
+    }));
 
     new cdk.CfnOutput(this, 'FunctionName', { value: fn.functionName });
     new cdk.CfnOutput(this, 'AliasArn', { value: alias.functionArn });

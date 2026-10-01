@@ -1,4 +1,6 @@
-// Invoked by SNS when a CloudWatch alarm on a Lambda alias goes into ALARM.
+// Invoked by SNS when a CloudWatch alarm goes into ALARM, and every few minutes by an
+// EventBridge schedule that re-checks alarms still in ALARM (CloudWatch only notifies on
+// state changes, so a rolled-back version that also fails would otherwise never trigger).
 // Moves the alias back to the previous published version and puts that version's
 // package back into $LATEST. No build: the package is the one Lambda already stores.
 import {
@@ -11,17 +13,31 @@ import {
   waitUntilFunctionUpdatedV2,
 } from '@aws-sdk/client-lambda';
 import { STSClient, AssumeRoleCommand } from '@aws-sdk/client-sts';
+import { CloudWatchClient, DescribeAlarmsCommand } from '@aws-sdk/client-cloudwatch';
 import config from './config.json' with { type: 'json' };
 
 const sts = new STSClient({});
+const cloudwatch = new CloudWatchClient({});
 const DEFAULT_ALIAS = process.env.DEFAULT_ALIAS ?? 'live';
 const ROLLBACK_ROLE_ARN = process.env.ROLLBACK_ROLE_ARN;
 // e.g. arn:aws:lambda:eu-central-1:123456789012:function:
 const FUNCTION_ARN_PREFIX = process.env.FUNCTION_ARN_PREFIX;
 // Only functions listed here are plugged into automatic rollback.
 const ENABLED_FUNCTIONS = new Set(config.enabledFunctions ?? []);
+// Automatic rollbacks in a row before giving up; the count resets on the next deploy.
+const MAX_CONSECUTIVE_ROLLBACKS = config.maxConsecutiveRollbacks ?? 2;
+// Time the alarm gets to evaluate a version after a rollback, before another one may happen.
+const COOLDOWN_MS = Number(process.env.ROLLBACK_COOLDOWN_MINUTES ?? 3) * 60_000;
+
+// The alias description records the last rollback, e.g. "auto-rollback #1 from v3 at 2026-10-01T16:00:00.000Z".
+// A deploy replaces it, which resets the count.
+const ROLLBACK_MARKER = /^(auto|manual)-rollback(?: #(\d+))? from v\d+ at (\S+)$/;
 
 export const handler = async (event) => {
+  if (event.type === 'scheduled-check') {
+    return checkAlarms(event.alarmNames ?? []);
+  }
+
   const results = [];
   for (const record of event.Records ?? []) {
     const alarm = JSON.parse(record.Sns.Message);
@@ -29,6 +45,26 @@ export const handler = async (event) => {
   }
   return results;
 };
+
+// Scheduled re-check: treat every listed alarm still in ALARM as if it had just fired.
+async function checkAlarms(alarmNames) {
+  if (alarmNames.length === 0) return [];
+  const { MetricAlarms = [] } = await cloudwatch.send(new DescribeAlarmsCommand({ AlarmNames: alarmNames }));
+  const results = [];
+  for (const alarm of MetricAlarms) {
+    console.log(`Scheduled check: alarm '${alarm.AlarmName}' is ${alarm.StateValue}`);
+    if (alarm.StateValue !== 'ALARM') {
+      results.push(skip(`alarm '${alarm.AlarmName}' is ${alarm.StateValue}`));
+      continue;
+    }
+    results.push(await handleAlarm({
+      AlarmName: alarm.AlarmName,
+      NewStateValue: alarm.StateValue,
+      Trigger: { Dimensions: alarm.Dimensions, Metrics: alarm.Metrics },
+    }));
+  }
+  return results;
+}
 
 async function handleAlarm(alarm) {
   console.log(`Alarm '${alarm.AlarmName}' state: ${alarm.NewStateValue}`);
@@ -50,23 +86,46 @@ async function handleAlarm(alarm) {
   const alias = await lambda.send(new GetAliasCommand({ FunctionName: functionName, Name: aliasName }));
   const currentVersion = Number(alias.FunctionVersion);
 
+  const last = lastRollback(alias.Description);
+  if (last) {
+    const sinceMs = Date.now() - last.at.getTime();
+    if (sinceMs < COOLDOWN_MS) {
+      return skip(`${functionName}:${aliasName} was rolled back ${Math.round(sinceMs / 1000)}s ago, giving the alarm time to evaluate version ${currentVersion}`);
+    }
+    if (last.count >= MAX_CONSECUTIVE_ROLLBACKS) {
+      return skip(`${functionName}:${aliasName} already rolled back ${last.count} times in a row (max ${MAX_CONSECUTIVE_ROLLBACKS}), manual action needed`);
+    }
+  }
+  const rollbackNumber = (last?.count ?? 0) + 1;
+
   const previousVersion = await findPreviousVersion(lambda, functionName, currentVersion);
   if (previousVersion === undefined) {
     return skip(`${functionName}:${aliasName} is on version ${currentVersion}, no older version to roll back to`);
   }
 
-  console.log(`Rolling back ${functionName}:${aliasName}: ${currentVersion} -> ${previousVersion}`);
+  console.log(`Rolling back ${functionName}:${aliasName}: ${currentVersion} -> ${previousVersion} (automatic rollback #${rollbackNumber})`);
   // RevisionId makes the update fail if someone else moved the alias since we read it.
   await lambda.send(new UpdateAliasCommand({
     FunctionName: functionName,
     Name: aliasName,
     FunctionVersion: String(previousVersion),
     RevisionId: alias.RevisionId,
+    Description: `auto-rollback #${rollbackNumber} from v${currentVersion} at ${new Date().toISOString()}`,
   }));
 
   const codeSha256 = await restoreLatest(lambda, functionName, previousVersion);
 
-  return { rolledBack: true, functionName, aliasName, from: currentVersion, to: previousVersion, latestCodeSha256: codeSha256 };
+  return { rolledBack: true, functionName, aliasName, from: currentVersion, to: previousVersion, rollbackNumber, latestCodeSha256: codeSha256 };
+}
+
+// Parses the marker left in the alias description by the last rollback, if any.
+// Manual rollbacks (from the workflow) start the cooldown but don't count towards the limit.
+function lastRollback(description) {
+  const match = ROLLBACK_MARKER.exec(description ?? '');
+  if (!match) return undefined;
+  const at = new Date(match[3]);
+  if (Number.isNaN(at.getTime())) return undefined;
+  return { count: match[1] === 'auto' ? Number(match[2] ?? 1) : 0, at };
 }
 
 // Uploads the given version's existing package as $LATEST, so unqualified calls run it too.

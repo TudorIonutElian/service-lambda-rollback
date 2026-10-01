@@ -47,21 +47,21 @@ jobs:
             --query 'FunctionVersion' --output text)
           echo "Alias '$ALIAS_NAME' currently points to version $CURRENT_VERSION"
 
-          # Version, LastModified, CodeSha256 - one line per published version, oldest first.
+          # Version, LastModified, CodeSha256, Description - one line per published version, oldest first.
           VERSION_ROWS=$(aws lambda list-versions-by-function --function-name "$FUNCTION_NAME" \
-            --query 'Versions[?Version!=`$LATEST`].[Version,LastModified,CodeSha256]' --output text | sort -n)
+            --query 'Versions[?Version!=`$LATEST`].[Version,LastModified,CodeSha256,Description]' --output text | sort -n)
           VERSIONS=$(cut -f1 <<<"$VERSION_ROWS")
 
           if [[ "$DRY_RUN" == "true" ]]; then
             {
               echo "## Versions of \`$FUNCTION_NAME\`"
               echo
-              echo "| Version | Last modified | Code SHA256 | |"
-              echo "|---|---|---|---|"
-              while IFS=$'\t' read -r version modified sha; do
+              echo "| Version | Description | Last modified | Code SHA256 | |"
+              echo "|---|---|---|---|---|"
+              while IFS=$'\t' read -r version modified sha description; do
                 marker=""
                 [[ "$version" == "$CURRENT_VERSION" ]] && marker="⬅ \`$ALIAS_NAME\`"
-                echo "| $version | $modified | \`${sha:0:12}…\` | $marker |"
+                echo "| $version | ${description//|/\\|} | $modified | \`${sha:0:12}…\` | $marker |"
               done <<<"$VERSION_ROWS"
               echo
             } | tee -a "$GITHUB_STEP_SUMMARY"
@@ -92,7 +92,8 @@ jobs:
 
           echo "Rolling back '$ALIAS_NAME': $CURRENT_VERSION -> $TARGET_VERSION"
           aws lambda update-alias --function-name "$FUNCTION_NAME" --name "$ALIAS_NAME" \
-            --function-version "$TARGET_VERSION" --output table
+            --function-version "$TARGET_VERSION" --output table \
+            --description "manual-rollback from v$CURRENT_VERSION at $(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
 
           # Put the target version's existing package back into $LATEST, so unqualified calls run it too.
           # Only code is restored; $LATEST keeps its current configuration. No new version is published.

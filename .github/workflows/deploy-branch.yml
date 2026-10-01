@@ -22,6 +22,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          # Full history: the Lambda version description is the last commit that touched lambda/.
+          fetch-depth: 0
           ref: ${{ inputs.branch }}
       - uses: actions/setup-node@v7
         with:

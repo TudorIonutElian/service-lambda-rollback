@@ -1,5 +1,6 @@
 {
   "enabledFunctions": [
     "service-lambda"
-  ]
+  ],
+  "maxConsecutiveRollbacks": 2
 }
