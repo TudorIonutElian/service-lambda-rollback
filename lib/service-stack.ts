@@ -69,12 +69,30 @@ export class ServiceStack extends cdk.Stack {
 
     rollbackTopic.addSubscription(new subscriptions.LambdaSubscription(rollbackFn));
 
-    // Errors on the alias (not the bare function), so the alarm carries
-    // FunctionName and Resource=<fn>:<alias> dimensions the rollback function reads.
-    const errorsAlarm = new cloudwatch.Alarm(this, 'LiveErrorsAlarm', {
-      alarmName: `${FUNCTION_NAME}-${ALIAS_NAME}-errors`,
-      alarmDescription: `Errors on ${FUNCTION_NAME}:${ALIAS_NAME}; triggers automatic rollback`,
-      metric: alias.metricErrors({ period: cdk.Duration.minutes(1), statistic: cloudwatch.Stats.SUM }),
+    // Errors on live and $LATEST only; calls to other numbered versions are ignored.
+    // One alarm (not one per resource) so a bad minute triggers a single rollback.
+    // Resource dimension: "<fn>:live" for the alias, "<fn>" for unqualified calls ($LATEST),
+    // "<fn>:$LATEST" when $LATEST is named explicitly.
+    const errorsFor = (resource: string) => new cloudwatch.Metric({
+      namespace: 'AWS/Lambda',
+      metricName: 'Errors',
+      dimensionsMap: { FunctionName: fn.functionName, Resource: resource },
+      period: cdk.Duration.minutes(1),
+      statistic: cloudwatch.Stats.SUM,
+    });
+    const errorsAlarm = new cloudwatch.Alarm(this, 'ErrorsAlarm', {
+      alarmName: `${FUNCTION_NAME}-errors`,
+      alarmDescription: `Errors on ${FUNCTION_NAME}:${ALIAS_NAME} or $LATEST; rolls back ${FUNCTION_NAME}:${ALIAS_NAME}`,
+      metric: new cloudwatch.MathExpression({
+        expression: 'FILL(live, 0) + FILL(unqualified, 0) + FILL(latest, 0)',
+        usingMetrics: {
+          live: errorsFor(`${fn.functionName}:${ALIAS_NAME}`),
+          unqualified: errorsFor(fn.functionName),
+          latest: errorsFor(`${fn.functionName}:$LATEST`),
+        },
+        label: `${FUNCTION_NAME} errors (live + $LATEST)`,
+        period: cdk.Duration.minutes(1),
+      }),
       threshold: 1,
       comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
       evaluationPeriods: 1,

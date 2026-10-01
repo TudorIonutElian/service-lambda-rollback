@@ -96,16 +96,27 @@ async function preHook(functionName) {
   });
 }
 
-// Alarms on an alias carry dimensions FunctionName=<fn> and Resource=<fn>:<alias>.
+// Single-metric alarms carry Trigger.Dimensions; metric-math alarms carry one
+// Trigger.Metrics[].MetricStat.Metric.Dimensions per input metric.
+// FunctionName=<fn>, Resource=<fn> | <fn>:<alias> | <fn>:$LATEST | <fn>:<version>.
 function targetFromAlarm(alarm) {
-  const dimensions = alarm.Trigger?.Dimensions ?? [];
-  const value = (name) => dimensions.find((d) => d.name === name)?.value;
+  const trigger = alarm.Trigger ?? {};
+  const dimensionSets = [
+    trigger.Dimensions,
+    ...(trigger.Metrics ?? []).map((m) => m.MetricStat?.Metric?.Dimensions),
+  ].filter(Boolean);
+  const values = (name) => dimensionSets.flatMap((dims) =>
+    dims.filter((d) => (d.name ?? d.Name) === name).map((d) => d.value ?? d.Value));
 
-  const functionName = value('FunctionName');
+  const functionName = values('FunctionName')[0];
   if (!functionName) return undefined;
 
-  const resource = value('Resource');
-  const aliasName = resource?.includes(':') ? resource.split(':').pop() : DEFAULT_ALIAS;
+  // Use an alias from the Resource dimension if there is one; $LATEST and numbered
+  // versions can't be moved, so errors there roll back the default alias.
+  const aliasName = values('Resource')
+    .map((resource) => resource.split(':')[1])
+    .find((qualifier) => qualifier && qualifier !== '$LATEST' && !/^\d+$/.test(qualifier))
+    ?? DEFAULT_ALIAS;
   return { functionName, aliasName };
 }
 
