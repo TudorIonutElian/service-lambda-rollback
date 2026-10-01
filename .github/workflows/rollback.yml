@@ -1,0 +1,67 @@
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: 'Lambda version to roll back to (leave empty for the previous version)'
+        required: false
+        default: ''
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: service-lambda-release
+  cancel-in-progress: false
+
+env:
+  FUNCTION_NAME: service-lambda
+  ALIAS_NAME: live
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Point the alias back at an already-published version. No build, no upload.
+      - name: Point alias at previous version
+        env:
+          TARGET_VERSION: ${{ inputs.target_version }}
+        run: |
+          set -euo pipefail
+
+          CURRENT_VERSION=$(aws lambda get-alias --function-name "$FUNCTION_NAME" --name "$ALIAS_NAME" \
+            --query 'FunctionVersion' --output text)
+          echo "Alias '$ALIAS_NAME' currently points to version $CURRENT_VERSION"
+
+          VERSIONS=$(aws lambda list-versions-by-function --function-name "$FUNCTION_NAME" \
+            --query 'Versions[?Version!=`$LATEST`].Version' --output text | tr '\t' '\n' | sort -n)
+
+          if [[ -z "$TARGET_VERSION" ]]; then
+            # Highest published version lower than the current one.
+            TARGET_VERSION=$(echo "$VERSIONS" | awk -v cur="$CURRENT_VERSION" '$1 < cur' | tail -n 1)
+            if [[ -z "$TARGET_VERSION" ]]; then
+              echo "::error::No version older than $CURRENT_VERSION exists - nothing to roll back to."
+              exit 1
+            fi
+          elif ! grep -qx "$TARGET_VERSION" <<<"$VERSIONS"; then
+            echo "::error::Version $TARGET_VERSION does not exist. Available: $(echo $VERSIONS)"
+            exit 1
+          fi
+
+          if [[ "$TARGET_VERSION" == "$CURRENT_VERSION" ]]; then
+            echo "Alias already on version $TARGET_VERSION - nothing to do."
+            exit 0
+          fi
+
+          echo "Rolling back '$ALIAS_NAME': $CURRENT_VERSION -> $TARGET_VERSION"
+          aws lambda update-alias --function-name "$FUNCTION_NAME" --name "$ALIAS_NAME" \
+            --function-version "$TARGET_VERSION" --output table
+
+          echo "Rolled back \`$FUNCTION_NAME:$ALIAS_NAME\` from version **$CURRENT_VERSION** to **$TARGET_VERSION**." >> "$GITHUB_STEP_SUMMARY"
