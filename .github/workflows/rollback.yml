@@ -7,6 +7,11 @@ on:
         description: 'Lambda version to roll back to (leave empty for the previous version)'
         required: false
         default: ''
+      dry_run:
+        description: 'Dry run: only list versions and show what would happen, do not roll back'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -30,9 +35,10 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
 
       # Point the alias back at an already-published version. No build, no upload.
-      - name: Point alias at previous version
+      - name: ${{ inputs.dry_run && 'Dry run - list versions' || 'Point alias at previous version' }}
         env:
           TARGET_VERSION: ${{ inputs.target_version }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
 
@@ -40,8 +46,25 @@ jobs:
             --query 'FunctionVersion' --output text)
           echo "Alias '$ALIAS_NAME' currently points to version $CURRENT_VERSION"
 
-          VERSIONS=$(aws lambda list-versions-by-function --function-name "$FUNCTION_NAME" \
-            --query 'Versions[?Version!=`$LATEST`].Version' --output text | tr '\t' '\n' | sort -n)
+          # Version, LastModified, CodeSha256 - one line per published version, oldest first.
+          VERSION_ROWS=$(aws lambda list-versions-by-function --function-name "$FUNCTION_NAME" \
+            --query 'Versions[?Version!=`$LATEST`].[Version,LastModified,CodeSha256]' --output text | sort -n)
+          VERSIONS=$(cut -f1 <<<"$VERSION_ROWS")
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+            {
+              echo "## Versions of \`$FUNCTION_NAME\`"
+              echo
+              echo "| Version | Last modified | Code SHA256 | |"
+              echo "|---|---|---|---|"
+              while IFS=$'\t' read -r version modified sha; do
+                marker=""
+                [[ "$version" == "$CURRENT_VERSION" ]] && marker="⬅ \`$ALIAS_NAME\`"
+                echo "| $version | $modified | \`${sha:0:12}…\` | $marker |"
+              done <<<"$VERSION_ROWS"
+              echo
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
 
           if [[ -z "$TARGET_VERSION" ]]; then
             # Highest published version lower than the current one.
@@ -56,7 +79,13 @@ jobs:
           fi
 
           if [[ "$TARGET_VERSION" == "$CURRENT_VERSION" ]]; then
-            echo "Alias already on version $TARGET_VERSION - nothing to do."
+            echo "Alias already on version $TARGET_VERSION - nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "**Dry run:** would roll back \`$FUNCTION_NAME:$ALIAS_NAME\` from version **$CURRENT_VERSION** to **$TARGET_VERSION**. Nothing was changed. Re-run without dry run (optionally with a version from the table) to roll back." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
