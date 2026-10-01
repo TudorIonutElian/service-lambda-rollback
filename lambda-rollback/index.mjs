@@ -1,10 +1,14 @@
 // Invoked by SNS when a CloudWatch alarm on a Lambda alias goes into ALARM.
-// Moves the alias back to the previous published version. No build, no upload.
+// Moves the alias back to the previous published version and puts that version's
+// package back into $LATEST. No build: the package is the one Lambda already stores.
 import {
   LambdaClient,
   GetAliasCommand,
+  GetFunctionCommand,
   UpdateAliasCommand,
+  UpdateFunctionCodeCommand,
   paginateListVersionsByFunction,
+  waitUntilFunctionUpdatedV2,
 } from '@aws-sdk/client-lambda';
 import { STSClient, AssumeRoleCommand } from '@aws-sdk/client-sts';
 import config from './config.json' with { type: 'json' };
@@ -60,7 +64,35 @@ async function handleAlarm(alarm) {
     RevisionId: alias.RevisionId,
   }));
 
-  return { rolledBack: true, functionName, aliasName, from: currentVersion, to: previousVersion };
+  const codeSha256 = await restoreLatest(lambda, functionName, previousVersion);
+
+  return { rolledBack: true, functionName, aliasName, from: currentVersion, to: previousVersion, latestCodeSha256: codeSha256 };
+}
+
+// Uploads the given version's existing package as $LATEST, so unqualified calls run it too.
+// Only code is restored; $LATEST keeps its current configuration. No new version is published.
+async function restoreLatest(lambda, functionName, version) {
+  const { Code, Configuration } = await lambda.send(new GetFunctionCommand({
+    FunctionName: functionName,
+    Qualifier: String(version),
+  }));
+  const response = await fetch(Code.Location);
+  if (!response.ok) throw new Error(`Downloading version ${version} package failed: HTTP ${response.status}`);
+  const zip = new Uint8Array(await response.arrayBuffer());
+
+  console.log(`Restoring $LATEST of ${functionName} to the package of version ${version} (${Configuration.CodeSha256})`);
+  const updated = await lambda.send(new UpdateFunctionCodeCommand({
+    FunctionName: functionName,
+    ZipFile: zip,
+    Publish: false,
+  }));
+  await waitUntilFunctionUpdatedV2({ client: lambda, maxWaitTime: 60 }, { FunctionName: functionName });
+
+  if (updated.CodeSha256 !== Configuration.CodeSha256) {
+    throw new Error(`$LATEST code hash ${updated.CodeSha256} does not match version ${version} (${Configuration.CodeSha256})`);
+  }
+  console.log(`$LATEST of ${functionName} now runs the code of version ${version}`);
+  return updated.CodeSha256;
 }
 
 // Runs before any rollback: checks the function is enabled in config.json and, if so,
@@ -80,7 +112,13 @@ async function preHook(functionName) {
       Version: '2012-10-17',
       Statement: [{
         Effect: 'Allow',
-        Action: ['lambda:GetAlias', 'lambda:ListVersionsByFunction', 'lambda:UpdateAlias'],
+        Action: [
+          'lambda:GetAlias',
+          'lambda:ListVersionsByFunction',
+          'lambda:UpdateAlias',
+          'lambda:GetFunction',
+          'lambda:UpdateFunctionCode',
+        ],
         Resource: [functionArn, `${functionArn}:*`],
       }],
     }),

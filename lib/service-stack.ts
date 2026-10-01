@@ -44,7 +44,8 @@ export class ServiceStack extends cdk.Stack {
       runtime: lambda.Runtime.NODEJS_22_X,
       handler: 'index.handler',
       code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda-rollback')),
-      timeout: cdk.Duration.seconds(30),
+      // Downloading and re-uploading the package, then waiting for the update to finish.
+      timeout: cdk.Duration.minutes(2),
       environment: {
         DEFAULT_ALIAS: ALIAS_NAME,
         FUNCTION_ARN_PREFIX: `arn:${cdk.Aws.PARTITION}:lambda:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:function:`,
@@ -61,7 +62,14 @@ export class ServiceStack extends cdk.Stack {
     const enabledArns = rollbackConfig.enabledFunctions.map((name) =>
       this.formatArn({ service: 'lambda', resource: 'function', resourceName: name, arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME }));
     rollbackRole.addToPolicy(new iam.PolicyStatement({
-      actions: ['lambda:GetAlias', 'lambda:ListVersionsByFunction', 'lambda:UpdateAlias'],
+      actions: [
+        'lambda:GetAlias',
+        'lambda:ListVersionsByFunction',
+        'lambda:UpdateAlias',
+        // Restoring $LATEST: read the target version's package, upload it as $LATEST.
+        'lambda:GetFunction',
+        'lambda:UpdateFunctionCode',
+      ],
       resources: enabledArns.flatMap((arn) => [arn, `${arn}:*`]),
     }));
     rollbackRole.grantAssumeRole(rollbackFn.role!);

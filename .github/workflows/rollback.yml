@@ -34,7 +34,8 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # Point the alias back at an already-published version. No build, no upload.
+      # Point the alias back at an already-published version, then put that version's
+      # package back into $LATEST. No build: the package is the one Lambda already stores.
       - name: ${{ inputs.dry_run && 'Dry run - list versions' || 'Point alias at previous version' }}
         env:
           TARGET_VERSION: ${{ inputs.target_version }}
@@ -84,7 +85,7 @@ jobs:
           fi
 
           if [[ "$DRY_RUN" == "true" ]]; then
-            echo "**Dry run:** would roll back \`$FUNCTION_NAME:$ALIAS_NAME\` from version **$CURRENT_VERSION** to **$TARGET_VERSION**. Nothing was changed. Re-run without dry run (optionally with a version from the table) to roll back." \
+            echo "**Dry run:** would roll back \`$FUNCTION_NAME:$ALIAS_NAME\` from version **$CURRENT_VERSION** to **$TARGET_VERSION** and restore \`\$LATEST\` to version $TARGET_VERSION's code. Nothing was changed. Re-run without dry run (optionally with a version from the table) to roll back." \
               | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
@@ -93,4 +94,19 @@ jobs:
           aws lambda update-alias --function-name "$FUNCTION_NAME" --name "$ALIAS_NAME" \
             --function-version "$TARGET_VERSION" --output table
 
-          echo "Rolled back \`$FUNCTION_NAME:$ALIAS_NAME\` from version **$CURRENT_VERSION** to **$TARGET_VERSION**." >> "$GITHUB_STEP_SUMMARY"
+          # Put the target version's existing package back into $LATEST, so unqualified calls run it too.
+          # Only code is restored; $LATEST keeps its current configuration. No new version is published.
+          read -r CODE_URL TARGET_SHA < <(aws lambda get-function --function-name "$FUNCTION_NAME" \
+            --qualifier "$TARGET_VERSION" --query '[Code.Location,Configuration.CodeSha256]' --output text)
+          echo "Restoring \$LATEST to the package of version $TARGET_VERSION ($TARGET_SHA)"
+          curl -sSfL -o "$RUNNER_TEMP/code.zip" "$CODE_URL"
+          LATEST_SHA=$(aws lambda update-function-code --function-name "$FUNCTION_NAME" \
+            --zip-file "fileb://$RUNNER_TEMP/code.zip" --no-publish --query 'CodeSha256' --output text)
+          aws lambda wait function-updated-v2 --function-name "$FUNCTION_NAME"
+          if [[ "$LATEST_SHA" != "$TARGET_SHA" ]]; then
+            echo "::error::\$LATEST code hash $LATEST_SHA does not match version $TARGET_VERSION ($TARGET_SHA)"
+            exit 1
+          fi
+
+          echo "Rolled back \`$FUNCTION_NAME:$ALIAS_NAME\` from version **$CURRENT_VERSION** to **$TARGET_VERSION**, and restored \`\$LATEST\` to version $TARGET_VERSION's code (\`$TARGET_SHA\`)." \
+            | tee -a "$GITHUB_STEP_SUMMARY"
