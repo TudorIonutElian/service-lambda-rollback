@@ -7,9 +7,6 @@ archived version and restores `$LATEST` from that version's zip.
 
 ![Architecture](docs/arch-diagram.png)
 
-> The diagram predates the DynamoDB/S3 archive. Regenerate it from
-> [docs/ARCHITECTURE_IMAGE_PROMPT.md](docs/ARCHITECTURE_IMAGE_PROMPT.md).
-
 ## How it works
 
 **Deploy.** Every deploy that changes the function's code or configuration publishes a new, immutable
