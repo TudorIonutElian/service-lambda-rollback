@@ -4,6 +4,7 @@
     {
       "name": "service-lambda",
       "enabled": true,
+      "alias": "live",
       "alarms": [
         "service-lambda-errors"
       ]

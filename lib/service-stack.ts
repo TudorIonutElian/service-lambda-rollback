@@ -3,10 +3,12 @@ import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as subscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
 import { Construct } from 'constructs';
@@ -16,6 +18,7 @@ export const FUNCTION_NAME = 'service-lambda';
 export const ALIAS_NAME = 'live';
 export const ROLLBACK_FUNCTION_NAME = 'service-lambda-rollback';
 export const ROLLBACK_TOPIC_NAME = 'service-lambda-rollback-notifications';
+export const VERSIONS_TABLE_NAME = 'service-lambda-rollback-versions';
 // How often EventBridge re-checks alarms that are still in ALARM.
 export const ROLLBACK_CHECK_INTERVAL_MINUTES = 5;
 // Minimum time between two rollbacks of the same alias, so the alarm can judge the new version.
@@ -58,8 +61,28 @@ export class ServiceStack extends cdk.Stack {
     const alias = new lambda.Alias(this, 'LiveAlias', {
       aliasName: ALIAS_NAME,
       version: fn.currentVersion,
-      // Replaces any rollback marker the rollback function left, resetting its rollback count.
-      description: `deployed ${description}`.slice(0, 256),
+    });
+
+    // Metadata of every published version of every registered function, plus a CURRENT item per
+    // function (version the alias points to, who set it, rollback count). Written by the rollback
+    // function's sync step and by rollbacks.
+    //   functionName = <fn>, sk = VERSION#0000000003 | CURRENT
+    const versionsTable = new dynamodb.TableV2(this, 'VersionsTable', {
+      tableName: VERSIONS_TABLE_NAME,
+      partitionKey: { name: 'functionName', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'sk', type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    // Package of every archived version, as <fn>/<fn>-<version>.zip. Rollbacks restore $LATEST from here.
+    const artifactsBucket = new s3.Bucket(this, 'ArtifactsBucket', {
+      bucketName: `${ROLLBACK_FUNCTION_NAME}-artifacts-${this.account}-${this.region}`,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
     // Alarms publish here; the rollback function moves the erroring alias back one version.
@@ -72,18 +95,23 @@ export class ServiceStack extends cdk.Stack {
       runtime: lambda.Runtime.NODEJS_22_X,
       handler: 'index.handler',
       code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda-rollback')),
-      // Downloading and re-uploading the package, then waiting for the update to finish.
+      // Archiving packages to S3, restoring $LATEST and waiting for the update to finish.
       timeout: cdk.Duration.minutes(2),
+      // Packages are held in memory while being copied to S3.
+      memorySize: 512,
       environment: {
         DEFAULT_ALIAS: ALIAS_NAME,
+        TABLE_NAME: versionsTable.tableName,
+        TABLE_ARN: versionsTable.tableArn,
+        BUCKET_NAME: artifactsBucket.bucketName,
         ROLLBACK_COOLDOWN_MINUTES: String(ROLLBACK_COOLDOWN_MINUTES),
         FUNCTION_ARN_PREFIX: `arn:${cdk.Aws.PARTITION}:lambda:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:function:`,
       },
     });
 
-    // The rollback function's own role has no Lambda permissions. Its pre-hook checks
-    // lambda-rollback/config.json, then assumes this role with a session policy scoped
-    // to the single erroring function. This role is the upper bound: registered functions only.
+    // The rollback function's own role has no Lambda, S3 or DynamoDB permissions. It assumes this
+    // role with a session policy scoped to a single function (its alias/versions, its S3 folder and
+    // its DynamoDB items). This role is the upper bound: registered functions only.
     const rollbackRole = new iam.Role(this, 'RollbackExecutionRole', {
       assumedBy: rollbackFn.role!,
       maxSessionDuration: cdk.Duration.hours(1),
@@ -101,6 +129,18 @@ export class ServiceStack extends cdk.Stack {
           'lambda:UpdateFunctionCode',
         ],
         resources: enabledArns.flatMap((arn) => [arn, `${arn}:*`]),
+      }));
+      rollbackRole.addToPolicy(new iam.PolicyStatement({
+        // Archive packages (PutObject) and let Lambda restore $LATEST from them (GetObject).
+        actions: ['s3:GetObject', 's3:PutObject'],
+        resources: registeredFunctions.map(({ name }) => artifactsBucket.arnForObjects(`${name}/*`)),
+      }));
+      rollbackRole.addToPolicy(new iam.PolicyStatement({
+        actions: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:Query'],
+        resources: [versionsTable.tableArn],
+        conditions: {
+          'ForAllValues:StringEquals': { 'dynamodb:LeadingKeys': registeredFunctions.map(({ name }) => name) },
+        },
       }));
     }
     rollbackRole.grantAssumeRole(rollbackFn.role!);
@@ -139,9 +179,10 @@ export class ServiceStack extends cdk.Stack {
     });
     errorsAlarm.addAlarmAction(new cloudwatchActions.SnsAction(rollbackTopic));
 
-    // CloudWatch only notifies when the alarm changes state. If the version we rolled back to
-    // also fails, the alarm just stays in ALARM; this schedule catches that and rolls back again
-    // (subject to the cooldown and maxConsecutiveRollbacks in lambda-rollback/config.json).
+    // Every run first syncs version metadata and packages of registered functions (DynamoDB + S3).
+    // Then, since CloudWatch only notifies when the alarm changes state, it re-checks registered
+    // alarms: if the version we rolled back to also fails, the alarm just stays in ALARM; this
+    // catches that and rolls back again (subject to the cooldown and maxConsecutiveRollbacks).
     // Which alarms are checked comes from the registered functions in config.json.
     new events.Rule(this, 'RollbackCheckSchedule', {
       ruleName: `${ROLLBACK_FUNCTION_NAME}-check`,
@@ -163,5 +204,7 @@ export class ServiceStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'FunctionName', { value: fn.functionName });
     new cdk.CfnOutput(this, 'AliasArn', { value: alias.functionArn });
     new cdk.CfnOutput(this, 'RollbackTopicArn', { value: rollbackTopic.topicArn });
+    new cdk.CfnOutput(this, 'VersionsTableName', { value: versionsTable.tableName });
+    new cdk.CfnOutput(this, 'ArtifactsBucketName', { value: artifactsBucket.bucketName });
   }
 }

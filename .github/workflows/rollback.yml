@@ -23,6 +23,8 @@ concurrency:
 env:
   FUNCTION_NAME: service-lambda
   ALIAS_NAME: live
+  ROLLBACK_FUNCTION_NAME: service-lambda-rollback
+  TABLE_NAME: service-lambda-rollback-versions
 
 jobs:
   rollback:
@@ -34,8 +36,22 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # Point the alias back at an already-published version, then put that version's
-      # package back into $LATEST. No build: the package is the one Lambda already stores.
+      # Make sure every published version is archived (S3 + DynamoDB) before choosing a target.
+      - name: Sync rollback metadata
+        run: |
+          set -euo pipefail
+          FUNCTION_ERROR=$(aws lambda invoke --function-name "$ROLLBACK_FUNCTION_NAME" \
+            --cli-binary-format raw-in-base64-out --cli-read-timeout 150 \
+            --payload "{\"type\":\"sync\",\"functionName\":\"$FUNCTION_NAME\"}" \
+            --query 'FunctionError' --output text "$RUNNER_TEMP/sync.json")
+          cat "$RUNNER_TEMP/sync.json"; echo
+          if [[ "$FUNCTION_ERROR" != "None" ]] || jq -e 'any(.[]; .synced != true)' "$RUNNER_TEMP/sync.json" >/dev/null; then
+            echo "::error::Sync failed: $(cat "$RUNNER_TEMP/sync.json")"
+            exit 1
+          fi
+
+      # Point the alias back at an archived version, then restore $LATEST from that version's
+      # zip in S3. No build: the package is the one archived when the version was published.
       - name: ${{ inputs.dry_run && 'Dry run - list versions' || 'Point alias at previous version' }}
         env:
           TARGET_VERSION: ${{ inputs.target_version }}
@@ -47,35 +63,43 @@ jobs:
             --query 'FunctionVersion' --output text)
           echo "Alias '$ALIAS_NAME' currently points to version $CURRENT_VERSION"
 
-          # Version, LastModified, CodeSha256, Description - one line per published version, oldest first.
-          VERSION_ROWS=$(aws lambda list-versions-by-function --function-name "$FUNCTION_NAME" \
-            --query 'Versions[?Version!=`$LATEST`].[Version,LastModified,CodeSha256,Description]' --output text | sort -n)
+          # One tab-separated line per archived version, oldest first:
+          # version, lastModified, codeSha256, s3Bucket, s3Key, rolledBackBy, description
+          # Empty fields become "-": bash `read` merges consecutive tabs, which would shift columns.
+          VERSION_ROWS=$(aws dynamodb query --table-name "$TABLE_NAME" --consistent-read \
+            --key-condition-expression 'functionName = :f AND begins_with(sk, :prefix)' \
+            --expression-attribute-values "{\":f\":{\"S\":\"$FUNCTION_NAME\"},\":prefix\":{\"S\":\"VERSION#\"}}" \
+            --output json \
+            | jq -r 'def orDash: if . == null or . == "" then "-" else . end;
+                     .Items[] | [.version.N, .lastModified.S, .codeSha256.S, .s3Bucket.S, .s3Key.S,
+                                 (.rolledBackBy.S | orDash), (.description.S | orDash)] | @tsv' \
+            | sort -n)
           VERSIONS=$(cut -f1 <<<"$VERSION_ROWS")
 
           if [[ "$DRY_RUN" == "true" ]]; then
             {
-              echo "## Versions of \`$FUNCTION_NAME\`"
+              echo "## Archived versions of \`$FUNCTION_NAME\`"
               echo
-              echo "| Version | Description | Last modified | Code SHA256 | |"
-              echo "|---|---|---|---|---|"
-              while IFS=$'\t' read -r version modified sha description; do
+              echo "| Version | Description | Last modified | Code SHA256 | S3 key | Rolled back by | |"
+              echo "|---|---|---|---|---|---|---|"
+              while IFS=$'\t' read -r version modified sha bucket key rolled_back_by description; do
                 marker=""
                 [[ "$version" == "$CURRENT_VERSION" ]] && marker="⬅ \`$ALIAS_NAME\`"
-                echo "| $version | ${description//|/\\|} | $modified | \`${sha:0:12}…\` | $marker |"
+                echo "| $version | ${description//|/\\|} | $modified | \`${sha:0:12}…\` | \`$key\` | $rolled_back_by | $marker |"
               done <<<"$VERSION_ROWS"
               echo
             } | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
           if [[ -z "$TARGET_VERSION" ]]; then
-            # Highest published version lower than the current one.
+            # Highest archived version lower than the current one.
             TARGET_VERSION=$(echo "$VERSIONS" | awk -v cur="$CURRENT_VERSION" '$1 < cur' | tail -n 1)
             if [[ -z "$TARGET_VERSION" ]]; then
-              echo "::error::No version older than $CURRENT_VERSION exists - nothing to roll back to."
+              echo "::error::No archived version older than $CURRENT_VERSION exists - nothing to roll back to."
               exit 1
             fi
           elif ! grep -qx "$TARGET_VERSION" <<<"$VERSIONS"; then
-            echo "::error::Version $TARGET_VERSION does not exist. Available: $(echo $VERSIONS)"
+            echo "::error::Version $TARGET_VERSION is not archived. Available: $(echo $VERSIONS)"
             exit 1
           fi
 
@@ -84,30 +108,46 @@ jobs:
             exit 0
           fi
 
+          IFS=$'\t' read -r _ _ TARGET_SHA TARGET_BUCKET TARGET_KEY _ < <(awk -F'\t' -v v="$TARGET_VERSION" '$1 == v' <<<"$VERSION_ROWS")
+
           if [[ "$DRY_RUN" == "true" ]]; then
-            echo "**Dry run:** would roll back \`$FUNCTION_NAME:$ALIAS_NAME\` from version **$CURRENT_VERSION** to **$TARGET_VERSION** and restore \`\$LATEST\` to version $TARGET_VERSION's code. Nothing was changed. Re-run without dry run (optionally with a version from the table) to roll back." \
+            echo "**Dry run:** would roll back \`$FUNCTION_NAME:$ALIAS_NAME\` from version **$CURRENT_VERSION** to **$TARGET_VERSION** and restore \`\$LATEST\` from \`s3://$TARGET_BUCKET/$TARGET_KEY\`. Nothing was changed. Re-run without dry run (optionally with a version from the table) to roll back." \
               | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           echo "Rolling back '$ALIAS_NAME': $CURRENT_VERSION -> $TARGET_VERSION"
           aws lambda update-alias --function-name "$FUNCTION_NAME" --name "$ALIAS_NAME" \
-            --function-version "$TARGET_VERSION" --output table \
-            --description "manual-rollback from v$CURRENT_VERSION at $(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+            --function-version "$TARGET_VERSION" --output table
 
-          # Put the target version's existing package back into $LATEST, so unqualified calls run it too.
-          # Only code is restored; $LATEST keeps its current configuration. No new version is published.
-          read -r CODE_URL TARGET_SHA < <(aws lambda get-function --function-name "$FUNCTION_NAME" \
-            --qualifier "$TARGET_VERSION" --query '[Code.Location,Configuration.CodeSha256]' --output text)
-          echo "Restoring \$LATEST to the package of version $TARGET_VERSION ($TARGET_SHA)"
-          curl -sSfL -o "$RUNNER_TEMP/code.zip" "$CODE_URL"
+          # Lambda pulls the archived zip from S3 itself. Only code is restored; $LATEST keeps its
+          # current configuration. No new version is published.
+          echo "Restoring \$LATEST from s3://$TARGET_BUCKET/$TARGET_KEY ($TARGET_SHA)"
           LATEST_SHA=$(aws lambda update-function-code --function-name "$FUNCTION_NAME" \
-            --zip-file "fileb://$RUNNER_TEMP/code.zip" --no-publish --query 'CodeSha256' --output text)
+            --s3-bucket "$TARGET_BUCKET" --s3-key "$TARGET_KEY" --no-publish \
+            --query 'CodeSha256' --output text)
           aws lambda wait function-updated-v2 --function-name "$FUNCTION_NAME"
           if [[ "$LATEST_SHA" != "$TARGET_SHA" ]]; then
             echo "::error::\$LATEST code hash $LATEST_SHA does not match version $TARGET_VERSION ($TARGET_SHA)"
             exit 1
           fi
 
-          echo "Rolled back \`$FUNCTION_NAME:$ALIAS_NAME\` from version **$CURRENT_VERSION** to **$TARGET_VERSION**, and restored \`\$LATEST\` to version $TARGET_VERSION's code (\`$TARGET_SHA\`)." \
+          # Record it: CURRENT starts the automatic rollback cooldown (manual rollbacks don't count
+          # towards the consecutive-rollback limit), and the version rolled back from is marked.
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+          aws dynamodb put-item --table-name "$TABLE_NAME" --item "$(jq -n \
+            --arg fn "$FUNCTION_NAME" --arg to "$TARGET_VERSION" --arg from "$CURRENT_VERSION" --arg now "$NOW" \
+            '{functionName: {S: $fn}, sk: {S: "CURRENT"}, version: {N: $to}, previousVersion: {N: $from},
+              updatedBy: {S: "manual-rollback"}, updatedAt: {S: $now}, lastRollbackAt: {S: $now},
+              rollbackCount: {N: "0"}}')"
+          aws dynamodb update-item --table-name "$TABLE_NAME" \
+            --key "$(jq -n --arg fn "$FUNCTION_NAME" --arg sk "$(printf 'VERSION#%010d' "$CURRENT_VERSION")" \
+              '{functionName: {S: $fn}, sk: {S: $sk}}')" \
+            --update-expression 'SET rolledBackAt = :at, rolledBackBy = :by, rollbackReason = :reason' \
+            --condition-expression 'attribute_exists(sk)' \
+            --expression-attribute-values "$(jq -n --arg now "$NOW" --arg actor "$GITHUB_ACTOR" \
+              '{":at": {S: $now}, ":by": {S: "manual-rollback"}, ":reason": {S: ("GitHub Actions by " + $actor)}}')" \
+            || echo "::warning::Version $CURRENT_VERSION is not archived; it was not marked as rolled back."
+
+          echo "Rolled back \`$FUNCTION_NAME:$ALIAS_NAME\` from version **$CURRENT_VERSION** to **$TARGET_VERSION**, and restored \`\$LATEST\` from \`s3://$TARGET_BUCKET/$TARGET_KEY\` (\`$TARGET_SHA\`)." \
             | tee -a "$GITHUB_STEP_SUMMARY"

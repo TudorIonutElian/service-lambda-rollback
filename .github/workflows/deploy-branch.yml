@@ -41,3 +41,16 @@ jobs:
           npx cdk deploy --require-approval never
         env:
           BRANCH: ${{ inputs.branch }}
+      # Archive the newly published version (S3 + DynamoDB) right away instead of waiting
+      # for the next scheduled check.
+      - name: Sync rollback metadata
+        run: |
+          set -euo pipefail
+          FUNCTION_ERROR=$(aws lambda invoke --function-name service-lambda-rollback \
+            --cli-binary-format raw-in-base64-out --cli-read-timeout 150 \
+            --payload '{"type":"sync"}' --query 'FunctionError' --output text "$RUNNER_TEMP/sync.json")
+          cat "$RUNNER_TEMP/sync.json"; echo
+          if [[ "$FUNCTION_ERROR" != "None" ]] || jq -e 'any(.[]; .synced == false)' "$RUNNER_TEMP/sync.json" >/dev/null; then
+            echo "::error::Sync failed: $(cat "$RUNNER_TEMP/sync.json")"
+            exit 1
+          fi
