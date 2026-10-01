@@ -69,6 +69,7 @@ async function handleAlarm(alarm) {
 // and the session policy narrows that role down to the target function.
 async function preHook(functionName) {
   if (!ENABLED_FUNCTIONS.has(functionName)) return undefined;
+  console.log(`Pre-hook: ${functionName} found in config.json, rollback enabled`);
 
   const functionArn = `${FUNCTION_ARN_PREFIX}${functionName}`;
   const { Credentials } = await sts.send(new AssumeRoleCommand({
@@ -84,7 +85,7 @@ async function preHook(functionName) {
       }],
     }),
   }));
-  console.log(`Pre-hook: ${functionName} enabled, using credentials scoped to ${functionArn}`);
+  console.log(`Pre-hook: using credentials scoped to ${functionArn}`);
 
   return new LambdaClient({
     credentials: {
