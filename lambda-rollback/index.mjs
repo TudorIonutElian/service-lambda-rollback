@@ -41,13 +41,18 @@ const TABLE_NAME = process.env.TABLE_NAME;
 const TABLE_ARN = process.env.TABLE_ARN;
 const BUCKET_NAME = process.env.BUCKET_NAME;
 
-// Functions registered for automatic rollback, their alias, and the alarms allowed to trigger them.
-// Deregister a function by removing it or setting "enabled": false.
+// Automatic rollbacks in a row before giving up; the count resets on the next deploy.
+// Default for functions that don't set their own maxConsecutiveRollbacks.
+const DEFAULT_MAX_CONSECUTIVE_ROLLBACKS = config.maxConsecutiveRollbacks ?? 2;
+// Functions registered for automatic rollback, their alias, rollback limit, and the alarms allowed
+// to trigger them. Deregister a function by removing it or setting "enabled": false.
 const REGISTERED = new Map((config.functions ?? [])
   .filter((fn) => fn.enabled !== false)
-  .map((fn) => [fn.name, { alias: fn.alias ?? DEFAULT_ALIAS, alarms: new Set(fn.alarms ?? []) }]));
-// Automatic rollbacks in a row before giving up; the count resets on the next deploy.
-const MAX_CONSECUTIVE_ROLLBACKS = config.maxConsecutiveRollbacks ?? 2;
+  .map((fn) => [fn.name, {
+    alias: fn.alias ?? DEFAULT_ALIAS,
+    alarms: new Set(fn.alarms ?? []),
+    maxConsecutiveRollbacks: fn.maxConsecutiveRollbacks ?? DEFAULT_MAX_CONSECUTIVE_ROLLBACKS,
+  }]));
 // Time the alarm gets to evaluate a version after a rollback, before another one may happen.
 const COOLDOWN_MS = Number(process.env.ROLLBACK_COOLDOWN_MINUTES ?? 3) * 60_000;
 
@@ -230,7 +235,7 @@ async function handleAlarm(alarm) {
     return skip(reason);
   }
   const { lambda, ddb } = clients;
-  const { alias: aliasName } = REGISTERED.get(functionName);
+  const { alias: aliasName, maxConsecutiveRollbacks } = REGISTERED.get(functionName);
 
   // Make sure the newest version is archived and any deploy since the last run is recorded.
   await syncFunction(clients, functionName);
@@ -245,8 +250,8 @@ async function handleAlarm(alarm) {
       return skip(`${functionName}:${aliasName} was rolled back ${Math.round(sinceMs / 1000)}s ago, giving the alarm time to evaluate version ${currentVersion}`);
     }
   }
-  if ((state?.rollbackCount ?? 0) >= MAX_CONSECUTIVE_ROLLBACKS) {
-    return skip(`${functionName}:${aliasName} already rolled back ${state.rollbackCount} times in a row (max ${MAX_CONSECUTIVE_ROLLBACKS}), manual action needed`);
+  if ((state?.rollbackCount ?? 0) >= maxConsecutiveRollbacks) {
+    return skip(`${functionName}:${aliasName} already rolled back ${state?.rollbackCount ?? 0} times in a row (max ${maxConsecutiveRollbacks}), manual action needed`);
   }
   const rollbackNumber = (state?.rollbackCount ?? 0) + 1;
 
