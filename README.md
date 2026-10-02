@@ -34,8 +34,9 @@ Sync runs after every deploy, every 5 minutes (scheduled check) and before every
    the alarm must be registered for it.
 4. The rollback function gets temporary credentials scoped to that single function: its alias and
    versions, its S3 folder and its DynamoDB items (STS `AssumeRole` with a session policy).
-5. It syncs, then checks the 3-minute cooldown and the consecutive-rollback limit from the `CURRENT`
-   record.
+5. It syncs, then checks the `CURRENT` record: a deploy or rollback must have happened within the
+   function's deployment window (default 10 minutes), otherwise the alarm isn't blamed on a change and
+   the rollback is skipped. It also checks the 3-minute cooldown and the consecutive-rollback limit.
 6. It moves `live` to the previous archived version, restores `$LATEST` from that version's zip in S3,
    and records the rollback in DynamoDB.
 
@@ -94,9 +95,10 @@ Edit `lambda-rollback/config.json` and deploy:
 ```json
 {
   "maxConsecutiveRollbacks": 2,
+  "deploymentWindowMinutes": 10,
   "functions": [
     { "name": "service-lambda", "enabled": true, "alias": "live", "alarms": ["service-lambda-errors"] },
-    { "name": "other-lambda", "alarms": ["other-lambda-errors"], "maxConsecutiveRollbacks": 3 }
+    { "name": "other-lambda", "alarms": ["other-lambda-errors"], "maxConsecutiveRollbacks": 3, "deploymentWindowMinutes": 30 }
   ]
 }
 ```
@@ -104,11 +106,13 @@ Edit `lambda-rollback/config.json` and deploy:
 | Field | Where | Default | Meaning |
 |---|---|---|---|
 | `maxConsecutiveRollbacks` | top level | `2` | Automatic rollbacks in a row before giving up, for functions that don't set their own |
+| `deploymentWindowMinutes` | top level | `10` | Automatic rollback only happens if a deploy or rollback happened within this many minutes, for functions that don't set their own |
 | `name` | function | required | Lambda function name |
 | `alarms` | function | `[]` | Alarms allowed to trigger this function's rollback |
 | `alias` | function | `live` | Alias to roll back |
 | `enabled` | function | `true` | `false` deregisters the function without removing the entry |
 | `maxConsecutiveRollbacks` | function | top-level value | This function's own limit; `0` turns off automatic rollback but keeps the archive and manual rollback |
+| `deploymentWindowMinutes` | function | top-level value | This function's own deployment window |
 
 The count resets on the next deploy.
 
@@ -134,6 +138,9 @@ npx cdk deploy
 - Call the function through its alias (`service-lambda:live`). The rollback also restores `$LATEST`'s
   code, but not its configuration.
 - After a rollback, `$LATEST` no longer matches git until the next deploy that changes `lambda/`.
+- The deployment window is measured from when the system recorded the deploy (`CURRENT.updatedAt`):
+  right after the deploy workflows, or at the latest on the next 5-minute scheduled check.
+- Every invocation of the rollback function logs its full input event (`Event: …`).
 - Only versions that have been synced can be rolled back to. Sync runs after deploys, every 5 minutes
   and before each rollback, so this only matters for versions deleted from Lambda before a sync.
 

@@ -1,5 +1,6 @@
 {
   "maxConsecutiveRollbacks": 2,
+  "deploymentWindowMinutes": 10,
   "functions": [
     {
       "name": "service-lambda",

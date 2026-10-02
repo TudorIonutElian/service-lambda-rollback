@@ -45,14 +45,19 @@ const BUCKET_NAME = process.env.BUCKET_NAME;
 // Automatic rollbacks in a row before giving up; the count resets on the next deploy.
 // Default for functions that don't set their own maxConsecutiveRollbacks.
 const DEFAULT_MAX_CONSECUTIVE_ROLLBACKS = config.maxConsecutiveRollbacks ?? 2;
-// Functions registered for automatic rollback, their alias, rollback limit, and the alarms allowed
-// to trigger them. Deregister a function by removing it or setting "enabled": false.
+// Automatic rollback only happens within this many minutes of the last deploy or rollback; an alarm
+// on a version that has been live longer is not blamed on the change and is skipped.
+// Default for functions that don't set their own deploymentWindowMinutes.
+const DEFAULT_DEPLOYMENT_WINDOW_MINUTES = config.deploymentWindowMinutes ?? 10;
+// Functions registered for automatic rollback, their alias, rollback limit, deployment window, and
+// the alarms allowed to trigger them. Deregister a function by removing it or setting "enabled": false.
 const REGISTERED = new Map((config.functions ?? [])
   .filter((fn) => fn.enabled !== false)
   .map((fn) => [fn.name, {
     alias: fn.alias ?? DEFAULT_ALIAS,
     alarms: new Set(fn.alarms ?? []),
     maxConsecutiveRollbacks: fn.maxConsecutiveRollbacks ?? DEFAULT_MAX_CONSECUTIVE_ROLLBACKS,
+    deploymentWindowMinutes: fn.deploymentWindowMinutes ?? DEFAULT_DEPLOYMENT_WINDOW_MINUTES,
   }]));
 // Time the alarm gets to evaluate a version after a rollback, before another one may happen.
 const COOLDOWN_MS = Number(process.env.ROLLBACK_COOLDOWN_MINUTES ?? 3) * 60_000;
@@ -64,6 +69,8 @@ const versionSk = (version) => `VERSION#${String(version).padStart(10, '0')}`;
 const s3Key = (functionName, version) => `${functionName}/${functionName}-${version}.zip`;
 
 export const handler = async (event) => {
+  console.log('Event:', JSON.stringify(event));
+
   if (event.type === 'scheduled-check') {
     await syncAll();
     const alarms = await describeRegisteredAlarms();
@@ -307,7 +314,7 @@ async function handleAlarm(alarm) {
     return skip(reason);
   }
   const { lambda, ddb } = clients;
-  const { alias: aliasName, maxConsecutiveRollbacks } = REGISTERED.get(functionName);
+  const { alias: aliasName, maxConsecutiveRollbacks, deploymentWindowMinutes } = REGISTERED.get(functionName);
 
   // Make sure the newest version is archived and any deploy since the last run is recorded.
   await syncFunction(clients, functionName);
@@ -316,6 +323,16 @@ async function handleAlarm(alarm) {
   const currentVersion = Number(alias.FunctionVersion);
 
   const state = await getCurrent(ddb, functionName);
+
+  // Only roll back a recent change. CURRENT.updatedAt is when the last deploy (recorded by sync:
+  // right after the deploy workflow, or within one scheduled check) or rollback happened.
+  const changedAt = state?.updatedAt ? new Date(state.updatedAt).getTime() : NaN;
+  const sinceChangeMs = Date.now() - changedAt;
+  if (!(sinceChangeMs <= deploymentWindowMinutes * 60_000)) {
+    const since = Number.isNaN(changedAt) ? 'no deploy or rollback recorded' : `last ${state.updatedBy ?? 'change'} ${Math.round(sinceChangeMs / 60_000)} min ago`;
+    return skip(`${functionName}:${aliasName} v${currentVersion}: no deploy or rollback in the last ${deploymentWindowMinutes} min (${since}), not rolling back`);
+  }
+
   if (state?.lastRollbackAt) {
     const sinceMs = Date.now() - new Date(state.lastRollbackAt).getTime();
     if (sinceMs < COOLDOWN_MS) {
