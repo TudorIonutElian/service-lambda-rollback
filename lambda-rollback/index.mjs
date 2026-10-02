@@ -428,17 +428,52 @@ async function recordRollback(ddb, functionName, { from, to, by, rollbackCount, 
       rollbackCount: N(rollbackCount),
     },
   }));
+
+  // How long the version rolled back from had been stable: from its stableAt until now. Only counts
+  // if it is still marked stable, i.e. it was marked stable during this time live.
+  const { Item: fromItem } = await ddb.send(new GetItemCommand({
+    TableName: TABLE_NAME,
+    Key: { functionName: S(functionName), sk: S(versionSk(from)) },
+    ProjectionExpression: 'stable, stableAt',
+    ConsistentRead: true,
+  }));
+  const stableForSeconds = fromItem?.stable?.BOOL === true && fromItem.stableAt?.S
+    ? Math.max(0, Math.round((Date.parse(now) - Date.parse(fromItem.stableAt.S)) / 1000))
+    : 0;
+  const stableFor = stableForSeconds > 0 ? formatDuration(stableForSeconds) : 'not marked stable while live';
+
   try {
     await ddb.send(new UpdateItemCommand({
       TableName: TABLE_NAME,
       Key: { functionName: S(functionName), sk: S(versionSk(from)) },
-      UpdateExpression: 'SET rolledBackAt = :at, rolledBackBy = :by, rollbackReason = :reason, stable = :false',
+      UpdateExpression: 'SET rolledBackAt = :at, rolledBackBy = :by, rollbackReason = :reason, stable = :false, '
+        + 'stableForSeconds = :stableForSeconds, stableFor = :stableFor',
       ConditionExpression: 'attribute_exists(sk)',
-      ExpressionAttributeValues: { ':at': S(now), ':by': S(by), ':reason': S(reason), ':false': { BOOL: false } },
+      ExpressionAttributeValues: {
+        ':at': S(now),
+        ':by': S(by),
+        ':reason': S(reason),
+        ':false': { BOOL: false },
+        ':stableForSeconds': N(stableForSeconds),
+        ':stableFor': S(stableFor),
+      },
     }));
+    console.log(`${functionName} v${from} was stable for: ${stableFor}`);
   } catch (err) {
     if (err.name !== 'ConditionalCheckFailedException') throw err;
   }
+}
+
+// e.g. 93784 -> "1d 2h 3m"; under a minute -> "45s".
+function formatDuration(seconds) {
+  const parts = [];
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days) parts.push(`${days}d`);
+  if (hours) parts.push(`${hours}h`);
+  if (minutes) parts.push(`${minutes}m`);
+  return parts.length > 0 ? parts.join(' ') : `${seconds}s`;
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -195,13 +195,35 @@ jobs:
             '{functionName: {S: $fn}, sk: {S: "CURRENT"}, version: {N: $to}, previousVersion: {N: $from},
               updatedBy: {S: "manual-rollback"}, updatedAt: {S: $now}, lastRollbackAt: {S: $now},
               rollbackCount: {N: "0"}}')"
-          aws dynamodb update-item --table-name "$TABLE_NAME" \
-            --key "$(jq -n --arg fn "$FUNCTION_NAME" --arg sk "$(printf 'VERSION#%010d' "$CURRENT_VERSION")" \
-              '{functionName: {S: $fn}, sk: {S: $sk}}')" \
-            --update-expression 'SET rolledBackAt = :at, rolledBackBy = :by, rollbackReason = :reason, stable = :false' \
+
+          VERSION_KEY=$(jq -n --arg fn "$FUNCTION_NAME" --arg sk "$(printf 'VERSION#%010d' "$CURRENT_VERSION")" \
+            '{functionName: {S: $fn}, sk: {S: $sk}}')
+
+          # How long the version rolled back from had been stable: from its stableAt until now. Only
+          # counts if it is still marked stable, i.e. it was marked stable during this time live.
+          IFS=$'\t' read -r STABLE_FOR_SECONDS STABLE_FOR < <(aws dynamodb get-item --table-name "$TABLE_NAME" \
+            --key "$VERSION_KEY" --consistent-read --output json \
+            | jq -r --arg now "$NOW" '
+                def ts: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+                def duration: . as $s
+                  | [ ($s / 86400 | floor | select(. > 0) | "\(.)d"),
+                      ($s % 86400 / 3600 | floor | select(. > 0) | "\(.)h"),
+                      ($s % 3600 / 60 | floor | select(. > 0) | "\(.)m") ]
+                  | if length > 0 then join(" ") else "\($s)s" end;
+                (.Item // {}) as $item
+                | (if $item.stable.BOOL == true and $item.stableAt.S != null
+                   then ([0, (($now | ts) - ($item.stableAt.S | ts))] | max) else 0 end) as $seconds
+                | [$seconds, (if $seconds > 0 then ($seconds | duration) else "not marked stable while live" end)]
+                | @tsv')
+
+          aws dynamodb update-item --table-name "$TABLE_NAME" --key "$VERSION_KEY" \
+            --update-expression 'SET rolledBackAt = :at, rolledBackBy = :by, rollbackReason = :reason, stable = :false, stableForSeconds = :stableForSeconds, stableFor = :stableFor' \
             --condition-expression 'attribute_exists(sk)' \
             --expression-attribute-values "$(jq -n --arg now "$NOW" --arg actor "$GITHUB_ACTOR" \
-              '{":at": {S: $now}, ":by": {S: "manual-rollback"}, ":reason": {S: ("GitHub Actions by " + $actor)}, ":false": {BOOL: false}}')" \
+              --arg seconds "$STABLE_FOR_SECONDS" --arg stableFor "$STABLE_FOR" \
+              '{":at": {S: $now}, ":by": {S: "manual-rollback"}, ":reason": {S: ("GitHub Actions by " + $actor)}, ":false": {BOOL: false},
+                ":stableForSeconds": {N: $seconds}, ":stableFor": {S: $stableFor}}')" \
+            && echo "Version $CURRENT_VERSION was stable for: $STABLE_FOR" \
             || echo "::warning::Version $CURRENT_VERSION is not archived; it was not marked as rolled back."
 
           echo "Rolled back \`$FUNCTION_NAME:$ALIAS_NAME\` from version **$CURRENT_VERSION** to **$TARGET_VERSION**, and restored \`\$LATEST\` from \`s3://$TARGET_BUCKET/$TARGET_KEY\` (\`$TARGET_SHA\`)." \

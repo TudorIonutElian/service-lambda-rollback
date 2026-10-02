@@ -68,7 +68,10 @@ Each run:
 2. **Marks stable versions:** if all of a function's registered alarms are `OK` and its live version
    has been live for at least 5 minutes, that version gets `stable: true` and `stableAt`, on both the
    `CURRENT` item and the version's own item. A version that is later rolled back from gets
-   `stable: false`.
+   `stable: false`, plus how long it had been stable: `stableForSeconds` (from `stableAt` to the
+   rollback) and `stableFor` as readable text, e.g. `2h 30m`. If it was never marked stable while
+   live, `stableForSeconds` is `0` and `stableFor` is `not marked stable while live`. This is set by
+   automatic and manual rollbacks alike.
 3. **Re-checks alarms:** CloudWatch only notifies when an alarm changes state. If the version rolled
    back to also fails, the alarm stays in `ALARM` and no new notification comes. Any registered alarm
    still in `ALARM` is handled as if it had just fired, subject to the same guards.
@@ -93,7 +96,7 @@ Table `service-lambda-rollback-versions`, partition key `functionName`, sort key
 
 | `sk` | Attributes |
 |---|---|
-| `VERSION#0000000003` | `version`, `codeSha256`, `description`, `lastModified`, `runtime`, `handler`, `memorySize`, `timeout`, `codeSize`, `s3Bucket`, `s3Key`, `archivedAt`; once its alarms stayed OK while live: `stable`, `stableAt`; after a rollback away from it: `rolledBackAt`, `rolledBackBy`, `rollbackReason`, `stable: false` |
+| `VERSION#0000000003` | `version`, `codeSha256`, `description`, `lastModified`, `runtime`, `handler`, `memorySize`, `timeout`, `codeSize`, `s3Bucket`, `s3Key`, `archivedAt`; once its alarms stayed OK while live: `stable`, `stableAt`; after a rollback away from it: `rolledBackAt`, `rolledBackBy`, `rollbackReason`, `stable: false`, `stableForSeconds`, `stableFor` |
 | `CURRENT` | `version` the alias points to, `previousVersion`, `updatedBy` (`deploy` / `auto-rollback` / `manual-rollback`), `updatedAt`, `lastRollbackAt`, `rollbackCount`, `stable`, `stableAt` |
 
 The S3 bucket and the table are kept if the stack is deleted (`RemovalPolicy.RETAIN`).

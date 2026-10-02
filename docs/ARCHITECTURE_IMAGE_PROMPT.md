@@ -74,7 +74,7 @@ GROUP C — "Rollback":
 GROUP D — "Version archive":
   - A DynamoDB icon labelled "DynamoDB: service-lambda-rollback-versions".
     Next to it, a small table sketch with two rows:
-      "functionName | sk = VERSION#0000000003 | codeSha256, description, runtime, s3Key, stable, rolledBackBy…"
+      "functionName | sk = VERSION#0000000003 | codeSha256, description, runtime, s3Key, stable, stableFor, rolledBackBy…"
       "functionName | sk = CURRENT | version, previousVersion, updatedBy, lastRollbackAt, rollbackCount, stable"
   - An S3 bucket icon labelled "S3: service-lambda-rollback-artifacts-<account>-<region>".
     Inside or under it, three small zip-file icons labelled
