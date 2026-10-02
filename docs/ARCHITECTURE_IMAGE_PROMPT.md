@@ -63,6 +63,7 @@ GROUP C — "Rollback":
       "1. Function registered & enabled in config.json?"
       "2. Alarm registered for that function?"
   - A second small checklist box labelled "Before rolling back (from DynamoDB CURRENT)":
+      "Deploy or rollback in the last 10 min (deploymentWindowMinutes)?"
       "Cooldown (3 min) passed?"
       "Under max consecutive rollbacks?"
   - An STS icon labelled "STS AssumeRole + session policy (one function: its Lambda, its S3
