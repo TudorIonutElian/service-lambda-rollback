@@ -1,4 +1,4 @@
-name: Rollback
+name: Rollback by version
 
 on:
   workflow_dispatch:
@@ -9,6 +9,17 @@ on:
         default: ''
       dry_run:
         description: 'Dry run: only list versions and show what would happen, do not roll back'
+        type: boolean
+        required: false
+        default: false
+  # Also used by "Rollback to commit", which resolves the chosen commit to a version first.
+  workflow_call:
+    inputs:
+      target_version:
+        type: string
+        required: false
+        default: ''
+      dry_run:
         type: boolean
         required: false
         default: false
