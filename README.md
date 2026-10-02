@@ -43,6 +43,24 @@ Sync runs after every deploy, on every scheduled check and before every rollback
 6. It moves `live` to the previous archived version, restores `$LATEST` from that version's zip in S3,
    and records the rollback in DynamoDB.
 
+### $LATEST-only failures
+
+If new code reaches `$LATEST` without a version being published or the alias being moved, calls to
+the bare function can fail while `live` is fine. Before rolling back the alias, the rollback function
+checks for this:
+
+1. It compares `$LATEST`'s code hash with the live version's archived code hash.
+2. If they differ, it reads the alias's own `Errors` metric for the last 5 minutes
+   (`LIVE_ERRORS_LOOKBACK_MINUTES`).
+3. If the alias had no errors, only `$LATEST` is failing: it restores `$LATEST` from the live
+   version's zip in S3 and leaves the alias where it is. If the alias also had errors, it does a normal
+   alias rollback (which restores `$LATEST` too).
+
+A `$LATEST`-only revert uses the same deployment window, measured from `$LATEST`'s last code change,
+and starts the cooldown, so the alarm can clear before anything else happens. It doesn't count towards
+`maxConsecutiveRollbacks`. It is recorded on `CURRENT` as `lastLatestRevertAt`,
+`latestRevertedFromSha`, `latestRevertedToVersion` and `latestRevertReason`.
+
 ### Rollback guards
 
 An automatic rollback is skipped, with a log line saying why, when any of these applies:
@@ -119,7 +137,7 @@ Table `service-lambda-rollback-versions`, partition key `functionName`, sort key
 | `sk` | Attributes |
 |---|---|
 | `VERSION#0000000003` | `version`, `codeSha256`, `description`, `lastModified`, `runtime`, `handler`, `memorySize`, `timeout`, `codeSize`, `s3Bucket`, `s3Key`, `archivedAt`; once its alarms stayed OK while live: `stable`, `stableAt`; after a rollback away from it: `rolledBackAt`, `rolledBackBy`, `rollbackReason`, `stable: false`, `stableForSeconds`, `stableFor` |
-| `CURRENT` | `version` the alias points to, `previousVersion`, `updatedBy` (`deploy` / `auto-rollback` / `manual-rollback`), `updatedAt`, `lastRollbackAt`, `rollbackCount`, `stable`, `stableAt` |
+| `CURRENT` | `version` the alias points to, `previousVersion`, `updatedBy` (`deploy` / `auto-rollback` / `manual-rollback`), `updatedAt`, `lastRollbackAt`, `rollbackCount`, `stable`, `stableAt`; after a `$LATEST`-only revert: `lastLatestRevertAt`, `latestRevertedFromSha`, `latestRevertedToVersion`, `latestRevertReason` |
 
 The S3 bucket and the table are kept if the stack is deleted (`RemovalPolicy.RETAIN`).
 
@@ -167,6 +185,7 @@ System-wide settings live as constants in `lib/service-stack.ts`:
 | `ROLLBACK_CHECK_INTERVAL_MINUTES` | `5` | How often the scheduled check runs |
 | `ROLLBACK_COOLDOWN_MINUTES` | `3` | Minimum time between two rollbacks of the same function |
 | `STABLE_AFTER_MINUTES` | `5` | How long a version must be live, with all its alarms OK, before it is marked stable |
+| `LIVE_ERRORS_LOOKBACK_MINUTES` | `5` | How far back to look for errors on the alias when deciding whether only `$LATEST` is failing |
 
 ## Rollback function invocations
 

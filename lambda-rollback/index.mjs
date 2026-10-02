@@ -20,7 +20,7 @@ import {
   waitUntilFunctionUpdatedV2,
 } from '@aws-sdk/client-lambda';
 import { STSClient, AssumeRoleCommand } from '@aws-sdk/client-sts';
-import { CloudWatchClient, DescribeAlarmsCommand } from '@aws-sdk/client-cloudwatch';
+import { CloudWatchClient, DescribeAlarmsCommand, GetMetricDataCommand } from '@aws-sdk/client-cloudwatch';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import {
   DynamoDBClient,
@@ -63,6 +63,8 @@ const REGISTERED = new Map((config.functions ?? [])
 const COOLDOWN_MS = Number(process.env.ROLLBACK_COOLDOWN_MINUTES ?? 3) * 60_000;
 // How long a version must have been live, with all its alarms OK, before it is marked stable.
 const STABLE_AFTER_MS = Number(process.env.STABLE_AFTER_MINUTES ?? 5) * 60_000;
+// How far back to look for errors on the alias when deciding whether only $LATEST is failing.
+const LIVE_ERRORS_LOOKBACK_MS = Number(process.env.LIVE_ERRORS_LOOKBACK_MINUTES ?? 5) * 60_000;
 
 const CURRENT_SK = 'CURRENT';
 const versionSk = (version) => `VERSION#${String(version).padStart(10, '0')}`;
@@ -324,6 +326,11 @@ async function handleAlarm(alarm) {
 
   const state = await getCurrent(ddb, functionName);
 
+  // $LATEST-only failure: new code was deployed to $LATEST without publishing a version or moving
+  // the alias, and the alias itself is healthy. Revert only $LATEST to the live version's code.
+  const latestOnly = await handleLatestOnly(clients, functionName, aliasName, currentVersion, state, alarm);
+  if (latestOnly) return latestOnly;
+
   // Only roll back a recent change. CURRENT.updatedAt is when the last deploy (recorded by sync:
   // right after the deploy workflow, or within one scheduled check) or rollback happened.
   const changedAt = state?.updatedAt ? new Date(state.updatedAt).getTime() : NaN;
@@ -333,10 +340,13 @@ async function handleAlarm(alarm) {
     return skip(`${functionName}:${aliasName} v${currentVersion}: no deploy or rollback in the last ${deploymentWindowMinutes} min (${since}), not rolling back`);
   }
 
-  if (state?.lastRollbackAt) {
-    const sinceMs = Date.now() - new Date(state.lastRollbackAt).getTime();
+  // A recent $LATEST-only revert also counts: the alarm may still be in ALARM from $LATEST's errors
+  // while the healthy live version is being re-evaluated.
+  for (const [at, what] of [[state?.lastRollbackAt, 'rolled back'], [state?.lastLatestRevertAt, 'had $LATEST reverted']]) {
+    if (!at) continue;
+    const sinceMs = Date.now() - new Date(at).getTime();
     if (sinceMs < COOLDOWN_MS) {
-      return skip(`${functionName}:${aliasName} was rolled back ${Math.round(sinceMs / 1000)}s ago, giving the alarm time to evaluate version ${currentVersion}`);
+      return skip(`${functionName}:${aliasName} ${what} ${Math.round(sinceMs / 1000)}s ago, giving the alarm time to evaluate version ${currentVersion}`);
     }
   }
   if ((state?.rollbackCount ?? 0) >= maxConsecutiveRollbacks) {
@@ -378,6 +388,82 @@ async function handleAlarm(alarm) {
   };
 }
 
+// Returns a result when this alarm is a $LATEST-only failure (handled or skipped here), or undefined
+// to continue with a normal alias rollback. It is $LATEST-only when $LATEST runs different code
+// from the live version and the alias had no errors in the last LIVE_ERRORS_LOOKBACK_MINUTES.
+async function handleLatestOnly(clients, functionName, aliasName, liveVersion, state, alarm) {
+  const { lambda, ddb } = clients;
+  const { deploymentWindowMinutes } = REGISTERED.get(functionName);
+
+  const { Configuration: latest } = await lambda.send(new GetFunctionCommand({ FunctionName: functionName }));
+  const live = await getVersionItem(ddb, functionName, liveVersion);
+  if (!live) {
+    console.log(`${functionName} v${liveVersion} is not archived; can't compare it with $LATEST`);
+    return undefined;
+  }
+  if (latest.CodeSha256 === live.codeSha256) return undefined;
+
+  const liveErrors = await countAliasErrors(functionName, aliasName);
+  if (liveErrors > 0) {
+    console.log(`${functionName}: $LATEST differs from v${liveVersion}, but ${functionName}:${aliasName} also had ${liveErrors} errors; rolling back the alias`);
+    return undefined;
+  }
+  console.log(`${functionName}: $LATEST (${latest.CodeSha256}) differs from live v${liveVersion} (${live.codeSha256}) and ${aliasName} has no errors: $LATEST-only failure`);
+
+  // Same guards as an alias rollback, measured from when $LATEST's code was changed.
+  const changedAt = Date.parse(String(latest.LastModified).replace(/\+0000$/, 'Z'));
+  const sinceChangeMs = Date.now() - changedAt;
+  if (!(sinceChangeMs <= deploymentWindowMinutes * 60_000)) {
+    return skip(`${functionName} $LATEST: last changed ${Math.round(sinceChangeMs / 60_000)} min ago, outside the ${deploymentWindowMinutes} min deployment window, not reverting`);
+  }
+  if (state?.lastLatestRevertAt && Date.now() - new Date(state.lastLatestRevertAt).getTime() < COOLDOWN_MS) {
+    return skip(`${functionName} $LATEST was reverted less than ${COOLDOWN_MS / 60_000} min ago`);
+  }
+
+  await restoreLatest(clients, functionName, live);
+  await recordLatestRevert(ddb, functionName, {
+    fromSha: latest.CodeSha256,
+    toVersion: liveVersion,
+    reason: `alarm ${alarm.AlarmName}`,
+  });
+
+  return {
+    rolledBack: true,
+    latestOnly: true,
+    functionName,
+    aliasName,
+    from: '$LATEST',
+    to: liveVersion,
+    restoredFrom: `s3://${live.s3Bucket}/${live.s3Key}`,
+  };
+}
+
+// Sum of Errors on <fn>:<alias> over the lookback window.
+async function countAliasErrors(functionName, aliasName) {
+  const end = new Date();
+  const start = new Date(end.getTime() - LIVE_ERRORS_LOOKBACK_MS);
+  const { MetricDataResults = [] } = await cloudwatch.send(new GetMetricDataCommand({
+    StartTime: start,
+    EndTime: end,
+    MetricDataQueries: [{
+      Id: 'aliasErrors',
+      MetricStat: {
+        Metric: {
+          Namespace: 'AWS/Lambda',
+          MetricName: 'Errors',
+          Dimensions: [
+            { Name: 'FunctionName', Value: functionName },
+            { Name: 'Resource', Value: `${functionName}:${aliasName}` },
+          ],
+        },
+        Period: 60,
+        Stat: 'Sum',
+      },
+    }],
+  }));
+  return (MetricDataResults[0]?.Values ?? []).reduce((sum, value) => sum + value, 0);
+}
+
 // Single-metric alarms carry Trigger.Dimensions; metric-math alarms carry one
 // Trigger.Metrics[].MetricStat.Metric.Dimensions per input metric.
 function functionFromAlarm(alarm) {
@@ -411,6 +497,24 @@ async function restoreLatest({ lambda }, functionName, target) {
     throw new Error(`$LATEST code hash ${updated.CodeSha256} does not match version ${target.version} (${target.codeSha256})`);
   }
   console.log(`$LATEST of ${functionName} now runs the code of version ${target.version}`);
+}
+
+// A $LATEST-only revert doesn't move the alias, so it doesn't count towards the consecutive-rollback
+// limit; it only starts the cooldown and is recorded on CURRENT.
+async function recordLatestRevert(ddb, functionName, { fromSha, toVersion, reason }) {
+  const now = new Date().toISOString();
+  try {
+    await ddb.send(new UpdateItemCommand({
+      TableName: TABLE_NAME,
+      Key: { functionName: S(functionName), sk: S(CURRENT_SK) },
+      UpdateExpression: 'SET lastLatestRevertAt = :at, latestRevertedFromSha = :sha, latestRevertedToVersion = :version, latestRevertReason = :reason',
+      ConditionExpression: 'attribute_exists(sk)',
+      ExpressionAttributeValues: { ':at': S(now), ':sha': S(fromSha), ':version': N(toVersion), ':reason': S(reason) },
+    }));
+  } catch (err) {
+    if (err.name !== 'ConditionalCheckFailedException') throw err;
+  }
+  console.log(`${functionName}: $LATEST reverted to the code of v${toVersion}`);
 }
 
 async function recordRollback(ddb, functionName, { from, to, by, rollbackCount, reason }) {
@@ -564,6 +668,7 @@ async function getCurrent(ddb, functionName) {
     updatedBy: Item.updatedBy?.S,
     updatedAt: Item.updatedAt?.S,
     stable: Item.stable?.BOOL === true,
+    lastLatestRevertAt: Item.lastLatestRevertAt?.S,
   };
 }
 
@@ -583,6 +688,21 @@ async function queryVersions(ddb, functionName) {
 }
 
 // Highest archived version lower than the current one.
+async function getVersionItem(ddb, functionName, version) {
+  const { Item } = await ddb.send(new GetItemCommand({
+    TableName: TABLE_NAME,
+    Key: { functionName: S(functionName), sk: S(versionSk(version)) },
+    ConsistentRead: true,
+  }));
+  if (!Item) return undefined;
+  return {
+    version: Number(Item.version.N),
+    codeSha256: Item.codeSha256.S,
+    s3Bucket: Item.s3Bucket.S,
+    s3Key: Item.s3Key.S,
+  };
+}
+
 async function findPreviousArchived(ddb, functionName, currentVersion) {
   if (currentVersion <= 1) return undefined;
   const { Items = [] } = await ddb.send(new QueryCommand({

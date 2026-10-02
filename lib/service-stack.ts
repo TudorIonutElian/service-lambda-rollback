@@ -25,6 +25,9 @@ export const ROLLBACK_CHECK_INTERVAL_MINUTES = 5;
 export const ROLLBACK_COOLDOWN_MINUTES = 3;
 // How long a version must be live, with all its alarms OK, before the scheduled check marks it stable.
 export const STABLE_AFTER_MINUTES = 5;
+// How far back the rollback function looks for errors on the alias, to tell a $LATEST-only failure
+// (revert $LATEST only) from a failing live version (roll back the alias).
+export const LIVE_ERRORS_LOOKBACK_MINUTES = 5;
 
 // Describes the code a published version contains: the last commit that touched lambda/.
 // It only changes when the function code changes, so it never forces a new version on its own.
@@ -108,6 +111,7 @@ export class ServiceStack extends cdk.Stack {
         BUCKET_NAME: artifactsBucket.bucketName,
         ROLLBACK_COOLDOWN_MINUTES: String(ROLLBACK_COOLDOWN_MINUTES),
         STABLE_AFTER_MINUTES: String(STABLE_AFTER_MINUTES),
+        LIVE_ERRORS_LOOKBACK_MINUTES: String(LIVE_ERRORS_LOOKBACK_MINUTES),
         FUNCTION_ARN_PREFIX: `arn:${cdk.Aws.PARTITION}:lambda:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:function:`,
       },
     });
@@ -203,6 +207,11 @@ export class ServiceStack extends cdk.Stack {
         resources: registeredAlarmArns,
       }));
     }
+    // Reading the alias's error metric; GetMetricData doesn't support resource-level permissions.
+    rollbackFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['cloudwatch:GetMetricData'],
+      resources: ['*'],
+    }));
 
     new cdk.CfnOutput(this, 'FunctionName', { value: fn.functionName });
     new cdk.CfnOutput(this, 'AliasArn', { value: alias.functionArn });
