@@ -78,17 +78,39 @@ Each run:
 
 ### Manual rollback
 
-The `Rollback` GitHub Actions workflow:
+Two GitHub Actions workflows roll back by hand:
 
-1. Stops straight away if a `Deploy` or `Deploy branch` run is running or queued. A dry run only warns.
-2. Syncs.
-3. Moves `live` back and restores `$LATEST` from S3 with the AWS CLI, and records the rollback in
+- **`Rollback by version`:** leave `target_version` empty to go back one version, or enter a
+  specific version.
+- **`Rollback to commit`:** pick one of the last 5 deployed commits from a dropdown, e.g.
+  `v7 · abc1234 Fix greeting` (the Lambda version, then the commit it was built from). It resolves
+  the choice to that version and runs `Rollback by version` with it.
+
+Both:
+
+1. Stop straight away if a `Deploy` or `Deploy branch` run is running or queued. A dry run only warns.
+2. Sync.
+3. Move `live` back and restore `$LATEST` from S3 with the AWS CLI, and record the rollback in
    DynamoDB. A manual rollback starts the cooldown but doesn't count towards the consecutive-rollback
    limit, and isn't limited by the deployment window.
 
-Leave `target_version` empty to go back one version, or enter a specific version. Tick `dry_run` to
-only list the archived versions (commit description, code hash, S3 key, whether it was rolled back)
-and see what would happen.
+Tick `dry_run` to only list the archived versions (commit description, code hash, S3 key, whether it
+was rolled back) and see what would happen.
+
+#### The commit dropdown
+
+GitHub can't fill a dropdown at run time: a `choice` input's options must be written in the workflow
+file. So after every deploy to `main`, the `Deploy` workflow's `update-commit-dropdown` job reads
+the last 5 archived versions from DynamoDB, rewrites the options between the
+`# BEGIN/END generated commit options` markers in `.github/workflows/rollback-to-commit.yml`, and
+pushes the change to `main`. That commit is marked `[skip ci]` and the file is in `paths-ignore`,
+so it doesn't start another deploy.
+
+Pushing a change to a workflow file needs a token with `workflow` scope; the built-in
+`GITHUB_TOKEN` isn't allowed to. Add one as the `WORKFLOW_PAT` secret (a fine-grained token with
+**Contents** and **Workflows** read/write on this repository). Without it, the job only warns and the
+dropdown keeps its previous options. If `main` is protected, the token's owner must be allowed to
+push to it.
 
 ## Version metadata (DynamoDB)
 
@@ -156,7 +178,7 @@ System-wide settings live as constants in `lib/service-stack.ts`:
 | SNS record with a CloudWatch alarm message | the alarm, via `service-lambda-rollback-notifications` | Automatic rollback for the alarm's function |
 | `{ "type": "scheduled-check" }` | EventBridge rule `service-lambda-rollback-check` | Sync, mark stable versions, re-check alarms |
 | `{ "type": "sync" }` | deploy workflows | Sync all registered functions |
-| `{ "type": "sync", "functionName": "<fn>" }` | Rollback workflow | Sync one function |
+| `{ "type": "sync", "functionName": "<fn>" }` | `Rollback by version` / `Rollback to commit` | Sync one function |
 
 ## Repository layout
 
@@ -167,22 +189,28 @@ System-wide settings live as constants in `lib/service-stack.ts`:
 | `lambda/` | `service-lambda` code (logs the version it runs as) |
 | `lambda-rollback/index.mjs` | Rollback function: sync/archive, stable marking, alarm handling, rollback |
 | `lambda-rollback/config.json` | Functions registered for automatic rollback |
-| `.github/workflows/` | `Deploy`, `Deploy branch`, `Rollback` |
+| `.github/workflows/` | `Deploy`, `Deploy branch`, `Rollback by version` (`rollback-by-version.yml`), `Rollback to commit` (`rollback-to-commit.yml`) |
 | `docs/` | Cost estimate, architecture diagram and the prompt used to generate it |
 
 ## Workflows
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `Deploy` | Push to `main` (except `.md` / `docs/` only changes), or manual | `cdk deploy`, then sync |
+| `Deploy` | Push to `main` (except `.md` / `docs/` / `rollback-to-commit.yml` only changes), or manual | `cdk deploy`, then sync, then refresh the `Rollback to commit` dropdown |
 | `Deploy branch` | Manual, choose a branch | `cdk deploy` from that branch, then sync |
-| `Rollback` | Manual, inputs `target_version` and `dry_run` | Stops if a deploy is running or queued; otherwise syncs, moves `live` back and restores `$LATEST` from S3. Dry run only lists versions |
+| `Rollback by version` | Manual, inputs `target_version` and `dry_run` | Stops if a deploy is running or queued; otherwise syncs, moves `live` back and restores `$LATEST` from S3. Dry run only lists versions |
+| `Rollback to commit` | Manual, inputs `commit` (dropdown of the last 5 deployed commits) and `dry_run` | Resolves the commit to its Lambda version, then runs `Rollback by version` |
 
-All three need these GitHub repository secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-`AWS_REGION`.
+GitHub repository secrets:
 
-When running `Deploy branch` or `Rollback` to test a branch, pick that branch under
-**Use workflow from**, so the branch's version of the workflow runs.
+| Secret | Used by | Required |
+|---|---|---|
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | all workflows | yes |
+| `WORKFLOW_PAT` | `Deploy` (refreshing the commit dropdown) | no; without it the dropdown isn't refreshed |
+
+When running `Deploy branch` or a rollback workflow to test a branch, pick that branch under
+**Use workflow from**, so the branch's version of the workflow runs. The `Rollback to commit` dropdown
+on a branch shows the options last committed to that branch.
 
 ## Setup
 
