@@ -11,11 +11,11 @@ on:
         # to main, from the DynamoDB version archive. Don't edit them by hand.
         options:
           # BEGIN generated commit options
+          - "v8 · 8"
           - "v7 · 7639438 Log the request id in service-lambda"
           - "v6 · ca993ef Add CDK Lambda with manual alias-based rollback workflow"
           - "v4 · 4-boom"
           - "v3 · 3"
-          - "v2 · 2"
           # END generated commit options
       dry_run:
         description: 'Dry run: only list versions and show what would happen, do not roll back'
